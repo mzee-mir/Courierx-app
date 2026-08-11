@@ -1,0 +1,27 @@
+# Dependencies across all 5 sub-apps
+**/node_modules/
+
+# Environment variables & secrets
+**/.env
+**/.env.*
+courierx-718ae-firebase-adminsdk-fbsvc-fb5f729b53.json
+google-services.json
+package.json
+package-lock.json
+app.json
+eas.json
+courierx-expo-builds
+courierx-mobile-78612-firebase-adminsdk-fbsvc-9f0e1-390e28b62e.json
+
+# Build & output directories
+**/dist/
+**/build/
+**/.next/
+**/.expo/
+**/.output/
+
+# Logs & System files
+*.log
+**/.DS_Store
+**/.antigravity/
+**/.idea/

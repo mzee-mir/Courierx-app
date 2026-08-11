@@ -1,0 +1,17 @@
+// enums/OrderEnums.ts
+
+export enum OrderStatus {
+  PENDING = 'PENDING',
+  ACCEPTED = 'ACCEPTED',
+  ARRIVED_AT_PICKUP = 'ARRIVED_AT_PICKUP',
+  PICKED_UP = 'PICKED_UP',
+  ARRIVED_AT_DROPOFF = 'ARRIVED_AT_DROPOFF',
+  DELIVERED = 'DELIVERED',
+  CANCELLED = 'CANCELLED',
+}
+
+export enum VehicleType {
+  BAJAJ = 'BAJAJ',
+  CAR = 'CAR',
+  TRUCK = 'TRUCK',
+}
