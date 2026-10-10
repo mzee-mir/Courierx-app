@@ -76,6 +76,129 @@ const transitionSchema = {
   })
 };
 
+const objectId = z.string().regex(/^[0-9a-fA-F]{24}$/);
+
+const initManifestDraftSchema = {
+  body: z.object({
+    shippingMode: z.enum(['AIR', 'SEA']),
+    originHub: z.string().min(1),
+    destinationHub: z.string().min(1)
+  })
+};
+
+const updateManifestDraftSchema = {
+  params: z.object({ id: objectId }),
+  body: z.object({
+    shipmentIds: z.array(z.string().regex(/^[0-9a-fA-F]{24}$/)).optional(),
+    metadata: z.object({
+      containerNumber: z.string().optional(),
+      vesselName: z.string().optional(),
+      estimatedArrival: z.string().optional()
+    }).optional()
+  }).refine(data => data.shipmentIds || data.metadata, { message: 'At least one field required' })
+};
+
+const manifestIdSchema = {
+  params: z.object({ id: objectId })
+};
+
+const verifyUnsealSchema = {
+  params: z.object({ id: objectId }),
+  body: z.object({
+    trackingNumber: z.string().min(1),
+    arrivalWeight: z.number().positive().optional(),
+    notes: z.string().max(300).optional(),
+    photos: z.array(z.string()).optional()
+  })
+};
+
+const finalizeUnsealingSchema = {
+  params: z.object({ id: objectId }),
+  body: z.object({
+    closingDescription: z.string().min(1).max(300).optional()
+  })
+};
+
+const shipmentIdSchema = {
+  params: z.object({ id: objectId })
+};
+
+const toggleWorkerStatusSchema = {
+  params: z.object({ id: objectId }),
+  body: z.object({ isSuspended: z.boolean() })
+};
+
+const updateWorkerPermissionsSchema = {
+  params: z.object({ id: objectId }),
+  body: z.object({
+    permissions: z.array(z.string()).min(1)
+  })
+};
+
+const updateSelfPasswordSchema = {
+  body: z.object({
+    currentPassword: z.string().min(1),
+    newPassword: z.string().min(8)
+  }).refine(data => data.currentPassword !== data.newPassword, { message: 'New password must differ from current' })
+};
+
+const updateSelfProfileSchema = {
+  body: z.object({
+    displayName: z.string().min(1).max(100).optional(),
+    imageUrl: z.string().url().optional()
+  }).refine(data => data.displayName || data.imageUrl, { message: 'At least one field required' })
+};
+
+const requestWithdrawalSchema = {
+  body: z.object({
+    amount: z.number().positive().max(100000)
+  })
+};
+
+const resolveExceptionSchema = {
+  params: z.object({ id: objectId }),
+  body: z.object({
+    resolutionAction: z.enum(['RELEASE', 'CANCEL', 'RETURN']),
+    notes: z.string().max(300).optional()
+  })
+};
+
+const createLocationSchema = {
+  body: z.object({
+    name: z.string().min(1).max(100),
+    type: z.enum(['WAREHOUSE', 'PORT', 'TRANSIT_HUB']),
+    country: z.string().min(1),
+    city: z.string().min(1),
+    address: z.string().min(1)
+  })
+};
+
+const updateDomesticRateSchema = {
+  body: z.object({
+    ratePerKg: z.number().positive().max(1000)
+  })
+};
+
+const updatePartnerSettingsSchema = {
+  body: z.object({
+    airRate: z.number().positive(),
+    seaRate: z.number().positive(),
+    dailyIntakeTarget: z.number().int().positive().optional(),
+    reason: z.string().max(300).optional()
+  })
+};
+
+const updateLocationSchema = {
+  params: z.object({ id: objectId }),
+  body: z.object({
+    name: z.string().min(1).max(100).optional(),
+    type: z.enum(['WAREHOUSE', 'PORT', 'TRANSIT_HUB']).optional(),
+    country: z.string().min(1).optional(),
+    city: z.string().min(1).optional(),
+    address: z.string().min(1).optional()
+  }).refine(data => Object.keys(data).length > 0, { message: 'At least one field required' })
+};
+
 // --- 🔓 PUBLIC PARTNER ACCESS ---
 router.post('/login', authLimiter, adminLogin);
 // Protect the Sudo check
@@ -145,6 +268,7 @@ router.post(
 router.post('/manifest/draft',
   mutationLimiter,
   enforceCapability(Permission.PARTNER_WRITE),
+  validate(initManifestDraftSchema),
   AdminImportController.initializeManifestDraft
 );
 
@@ -158,6 +282,7 @@ router.get('/manifests/:id', AdminImportController.getManifestDetail);
 router.patch('/manifest/draft/:id',
   mutationLimiter,
   enforceCapability(Permission.PARTNER_WRITE),
+  validate(updateManifestDraftSchema),
   AdminImportController.updateManifestDraft
 );
 
@@ -172,6 +297,7 @@ router.post(
 router.post('/manifest/:id/seal',
   mutationLimiter,
   enforceCapability(Permission.PARTNER_WRITE),
+  validate(manifestIdSchema),
   AdminImportController.sealManifest
 );
 
@@ -180,24 +306,27 @@ router.get('/manifests/:id/authority', AdminImportController.getManifestAuthorit
 router.patch('/manifests/:id/transition',
   mutationLimiter,
   enforceCapability(Permission.PARTNER_WRITE),
+  validate(transitionSchema),
   AdminImportController.transitionManifest // 👈 Includes status propagation to children
 );
 
 router.get('/shipments/track/:trackingNumber', ImportPartnerController.trackShipment);
 router.get('/handoff/queue', ImportPartnerController.getHandoffQueue);
-router.post('/shipments/:id/handoff', enforceCustody, mutationLimiter, ImportPartnerController.processHandoff)
+router.post('/shipments/:id/handoff', enforceCustody, mutationLimiter, validate(shipmentIdSchema), ImportPartnerController.processHandoff)
 /**
  * 5. DESTINATION OPS: UNSEALING & HANDOFF
  */
 router.post('/manifests/:id/verify-item',
   mutationLimiter,
   enforceCapability(Permission.PARTNER_WRITE),
+  validate(verifyUnsealSchema),
   ImportPartnerController.verifyUnsealItem
 );
 
 router.post('/manifests/:id/finalize',
   mutationLimiter,
   enforceCapability(Permission.PARTNER_WRITE),
+  validate(finalizeUnsealingSchema),
   ImportPartnerController.finalizeUnsealing
 );
 
@@ -207,12 +336,12 @@ router.post('/manifests/:id/finalize',
  */
 router.get('/staff', enforceCapability(Permission.MANAGE_STAFF), PartnerStaffController.getStaffMembers);
 router.post('/staff', mutationLimiter, enforceCapability(Permission.MANAGE_STAFF), validate(createPartnerStaffSchema), PartnerStaffController.createWorker);
-router.patch('/staff/:id/status', mutationLimiter, enforceCapability(Permission.MANAGE_STAFF), PartnerStaffController.toggleWorkerStatus);
+router.patch('/staff/:id/status', mutationLimiter, enforceCapability(Permission.MANAGE_STAFF), validate(toggleWorkerStatusSchema), PartnerStaffController.toggleWorkerStatus);
 router.get('/staff/:staffId/history', enforceCapability(Permission.MANAGE_STAFF), PartnerStaffController.getStaffLoginHistory);
 
-router.patch('/profile/password', mutationLimiter, PartnerStaffController.updateSelfPassword);
-router.patch('/staff/:id/permissions', mutationLimiter, enforceCapability(Permission.MANAGE_STAFF), PartnerStaffController.updateWorkerPermissions);
-router.patch('/profile/self', mutationLimiter, PartnerStaffController.updateSelfProfile);
+router.patch('/profile/password', mutationLimiter, validate(updateSelfPasswordSchema), PartnerStaffController.updateSelfPassword);
+router.patch('/staff/:id/permissions', mutationLimiter, enforceCapability(Permission.MANAGE_STAFF), validate(updateWorkerPermissionsSchema), PartnerStaffController.updateWorkerPermissions);
+router.patch('/profile/self', mutationLimiter, validate(updateSelfProfileSchema), PartnerStaffController.updateSelfProfile);
 
 router.get(
   '/settings/active-rates',
@@ -221,8 +350,8 @@ router.get(
 );
 
 
-router.get('/finance/summary', PartnerFinanceController.getFinanceSummary);
-router.post('/finance/withdraw', PartnerFinanceController.requestWithdrawal);
+router.get('/finance/summary', enforceCapability(Permission.PARTNER_FINANCE), PartnerFinanceController.getFinanceSummary);
+router.post('/finance/withdraw', enforceCapability(Permission.PARTNER_FINANCE), mutationLimiter, validate(requestWithdrawalSchema), PartnerFinanceController.requestWithdrawal);
 //router.get('/finance/transactions', PartnerFinanceController.getTransactions);
 
 //  My Locations (For Staff Assignment)
@@ -233,7 +362,7 @@ router.post('/auth/verify-sudo', authLimiter, verifySudoMode);
 router.get('/audit-trail', ImportPartnerController.getOrgAuditTrail);
 
 router.get('/inventory/blocked', ImportPartnerController.getBlockedInventory);
-router.post('/shipments/:id/resolve-exception', enforceCustody, mutationLimiter, ImportPartnerController.resolveShipmentException);
+router.post('/shipments/:id/resolve-exception', enforceCustody, mutationLimiter, validate(resolveExceptionSchema), ImportPartnerController.resolveShipmentException);
 
 router.get(
   '/profile/public',
@@ -249,15 +378,16 @@ router.patch(
   ImportPartnerController.updatePublicProfile
 );
 
-router.post('/settings/locations', mutationLimiter, enforceCapability(Permission.SYSTEM_CONFIG), ImportPartnerController.createLocation);
-router.patch('/settings/domestic-rate', mutationLimiter, enforceCapability(Permission.PARTNER_MANAGE_RATES), ImportPartnerController.updateDomesticRate);
+router.post('/settings/locations', mutationLimiter, enforceCapability(Permission.SYSTEM_CONFIG), validate(createLocationSchema), ImportPartnerController.createLocation);
+router.patch('/settings/domestic-rate', mutationLimiter, enforceCapability(Permission.PARTNER_MANAGE_RATES), validate(updateDomesticRateSchema), ImportPartnerController.updateDomesticRate);
 // 👈 ADD THIS: This maps to /api/v1/partner/settings/rates
 router.patch(
   '/settings/rates',
   mutationLimiter, enforceCapability(Permission.SYSTEM_CONFIG),
+  validate(updatePartnerSettingsSchema),
   ImportPartnerController.updatePartnerSettings);
 
-router.patch('/settings/locations/:id', mutationLimiter, enforceCapability(Permission.SYSTEM_CONFIG), ImportPartnerController.updateLocation);
-router.delete('/settings/locations/:id', mutationLimiter, enforceCapability(Permission.SYSTEM_CONFIG), ImportPartnerController.deleteLocation);
+router.patch('/settings/locations/:id', mutationLimiter, enforceCapability(Permission.SYSTEM_CONFIG), validate(updateLocationSchema), ImportPartnerController.updateLocation);
+router.delete('/settings/locations/:id', mutationLimiter, enforceCapability(Permission.SYSTEM_CONFIG), validate(manifestIdSchema), ImportPartnerController.deleteLocation);
 
 export default router;  

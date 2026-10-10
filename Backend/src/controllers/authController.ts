@@ -3,6 +3,11 @@ import admin from 'firebase-admin';
 import { User, UserRole } from '../models/User';
 import jwt from 'jsonwebtoken';
 
+export const SELF_ASSIGNABLE_ROLES: UserRole[] = [UserRole.CUSTOMER, UserRole.DRIVER];
+
+export const isSelfAssignableRole = (role: string): boolean =>
+  SELF_ASSIGNABLE_ROLES.includes(role as UserRole);
+
 export const verifyIdentity = async (req: Request, res: Response) => {
   console.log("the phone reached the server")
   // 'appRole' is the role requested by the app context (customer or driver)
@@ -11,6 +16,14 @@ export const verifyIdentity = async (req: Request, res: Response) => {
   if (!idToken || !appRole) {
     return res.status(400).json({ error: 'INVALID_REQUEST: Identity token and appRole required' });
   }
+
+  // Security: Only self-assignable roles may be requested via identity verification.
+  // Privileged roles (admin/partner) are provisioned only through protected flows
+  // (adminLogin, PartnerStaffController.createWorker, seedAdmin).
+  if (!isSelfAssignableRole(appRole)) {
+    return res.status(400).json({ error: 'INVALID_ROLE_REQUEST' });
+  }
+
   console.log("the phone reached the server")
   try {
     // 1. Verify Identity via Firebase Admin SDK

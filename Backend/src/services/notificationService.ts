@@ -1,6 +1,10 @@
-import admin from 'firebase-admin';
+import Expo, { ExpoPushMessage, ExpoPushTicket } from 'expo-server-sdk';
 import { User } from '../models/User';
-import mongoose from 'mongoose';
+
+// Push delivery goes through the Expo push service (expo-server-sdk).
+// Clients must register an Expo push token (getExpoPushTokenAsync) for delivery
+// to succeed; native FCM/APNs tokens are not deliverable on this channel.
+const expo = new Expo();
 
 // Maps an ImportStatus → the user preference key that can disable it
 const STATUS_PREFERENCE_MAP: Record<string, keyof NonNullable<any>> = {
@@ -45,6 +49,27 @@ const STATUS_NOTIFICATION_COPY: Record<string, (itemDescription: string, extra?:
   }),
 };
 
+// Pure helpers (testable without a network/DB round trip)
+export const isExpoPushToken = (token: unknown): token is string => Expo.isExpoPushToken(token);
+
+export const buildPushMessage = (
+  token: string,
+  title: string,
+  body: string,
+  data: Record<string, string> = {}
+): ExpoPushMessage => ({
+  to: token,
+  title,
+  body,
+  data,
+  sound: 'default',
+  priority: 'high',
+  channelId: 'default',
+});
+
+export const isDeviceNotRegistered = (ticket: ExpoPushTicket | undefined): boolean =>
+  !!ticket && ticket.status === 'error' && ticket.details?.error === 'DeviceNotRegistered';
+
 export class NotificationService {
   /**
    * Send a push notification to a single user by their userId.
@@ -56,24 +81,32 @@ export class NotificationService {
     body: string,
     data?: Record<string, string>
   ): Promise<void> {
-    const user = await User.findById(userId).select('pushToken').lean();
+    const user = await User.findById(userId).select('+pushToken').lean();
     if (!user?.pushToken) return;
 
+    // Only Expo push tokens are deliverable via expo-server-sdk.
+    // Retire legacy/native tokens so we stop retrying them forever.
+    if (!isExpoPushToken(user.pushToken)) {
+      await User.updateOne({ _id: user._id }, { $unset: { pushToken: 1 } });
+      return;
+    }
+
     try {
-      await admin.messaging().send({
-        token: user.pushToken,
-        notification: { title, body },
-        data: data || {},
-        android: { priority: 'high' },
-        apns: { payload: { aps: { sound: 'default' } } },
-      });
+      const tickets = await expo.sendPushNotificationsAsync([
+        buildPushMessage(user.pushToken, title, body, data || {}),
+      ]);
+
+      // Device removed the app / token no longer registered — stop targeting it.
+      if (isDeviceNotRegistered(tickets[0])) {
+        await User.updateOne({ _id: user._id }, { $unset: { pushToken: 1 } });
+      }
     } catch (err: any) {
       console.error(`[NotificationService] Failed to send to ${userId}:`, err.message);
     }
   }
 
   /**
-   * Task 5.1: Fire a push notification for a specific import status transition.
+   * Fire a push notification for a specific import status transition.
    * Checks the user's notificationPreferences before sending.
    */
   public static async sendImportStatusNotification(opts: {
@@ -92,7 +125,7 @@ export class NotificationService {
 
     // Check user preferences if a key exists for this status
     if (prefKey) {
-      const user = await User.findById(userId).select(`pushToken notificationPreferences`).lean();
+      const user = await User.findById(userId).select('+pushToken notificationPreferences').lean();
       if (!user?.pushToken) return;
 
       const prefs = (user as any).notificationPreferences;
@@ -100,21 +133,14 @@ export class NotificationService {
         // User has opted out of this notification type
         return;
       }
-
-      const { title, body } = copyFn(itemDescription, extraDetail);
-      await NotificationService.sendToUser(userId, title, body, {
-        type: 'IMPORT_STATUS',
-        importId,
-        status: newStatus,
-      });
-    } else {
-      const { title, body } = copyFn(itemDescription, extraDetail);
-      await NotificationService.sendToUser(userId, title, body, {
-        type: 'IMPORT_STATUS',
-        importId,
-        status: newStatus,
-      });
     }
+
+    const { title, body } = copyFn(itemDescription, extraDetail);
+    await NotificationService.sendToUser(userId, title, body, {
+      type: 'IMPORT_STATUS',
+      importId,
+      status: newStatus,
+    });
   }
 
   /**
@@ -125,17 +151,27 @@ export class NotificationService {
     const users = await User.find({
       roles: role,
       pushToken: { $exists: true }
-    }).select('pushToken');
+    }).select('_id +pushToken').lean();
 
-    const tokens = users.map(u => u.pushToken).filter(t => t !== undefined) as string[];
-    if (tokens.length === 0) return;
+    const targets = users.filter(u => isExpoPushToken(u.pushToken));
+    if (targets.length === 0) return null;
 
-    const message = {
-      notification: { title, body },
-      tokens,
-    };
+    const messages = targets.map(u => buildPushMessage(u.pushToken, title, body, {}));
 
-    const response = await admin.messaging().sendEachForMulticast(message);
-    return response;
+    try {
+      const tickets = await expo.sendPushNotificationsAsync(messages);
+
+      // Retire tokens that are no longer registered
+      for (let i = 0; i < tickets.length; i++) {
+        if (isDeviceNotRegistered(tickets[i])) {
+          await User.updateOne({ _id: targets[i]._id }, { $unset: { pushToken: 1 } });
+        }
+      }
+
+      return tickets;
+    } catch (err: any) {
+      console.error(`[NotificationService] Broadcast to role ${role} failed:`, err.message);
+      return null;
+    }
   }
 }

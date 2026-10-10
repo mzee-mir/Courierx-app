@@ -24,7 +24,7 @@ export interface IManifest extends Document {
     estimatedArrival: Date;
   };
   createdAt: Date;
-  upDatedAt: Date;
+  updatedAt: Date;
 }
 
 

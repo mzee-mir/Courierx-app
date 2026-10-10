@@ -1,8 +1,8 @@
 import cron from 'node-cron';
-import { processExpiryCheck } from './importExpiryWorker';
+import { processExpiredDeclarations } from './importExpiryWorker';
 import { processSlaBreach } from './importSlaWorker';
 import { processReadyForDeliveryReminders } from './importReminderWorker';
-import { computePartnerMetrics } from './partnerMetricsWorker';
+import { PartnerMetricsWorker } from './partnerMetricsWorker';
 
 export const startCronJobs = (): void => {
   console.log('[cronScheduler] Initializing background workers...');
@@ -11,7 +11,7 @@ export const startCronJobs = (): void => {
   cron.schedule('0 0 * * *', async () => {
     console.log('[cronScheduler] Running importExpiryWorker...');
     try {
-      await processExpiryCheck();
+      await processExpiredDeclarations();
     } catch (err: any) {
       console.error('[cronScheduler] importExpiryWorker failed:', err.message);
     }
@@ -41,11 +41,27 @@ export const startCronJobs = (): void => {
   cron.schedule('0 3 * * 1', async () => {
     console.log('[cronScheduler] Running partnerMetricsWorker...');
     try {
-      await computePartnerMetrics();
+      await PartnerMetricsWorker.runWeeklyAggregation();
     } catch (err: any) {
       console.error('[cronScheduler] partnerMetricsWorker failed:', err.message);
     }
   });
 
+  // 5. Driver Heartbeat Sweep: Runs every minute
+  cron.schedule('* * * * *', async () => {
+    try {
+      const { transitionStaleDrivers } = await import('../models/DriverLocation');
+      const result = await transitionStaleDrivers();
+      if (result.markedOffline > 0 || result.markedStale > 0 || result.markedGrace > 0) {
+        console.log(
+          `[cronScheduler] Heartbeat sweep: ${result.markedOffline} offline, ${result.markedStale} stale, ${result.markedGrace} grace`
+        );
+      }
+    } catch (err: any) {
+      console.error('[cronScheduler] transitionStaleDrivers failed:', err.message);
+    }
+  });
+
   console.log('[cronScheduler] All background workers scheduled successfully.');
 };
+

@@ -7,6 +7,7 @@ import { User, UserRole } from '../models/User';
 import { ImportRequest, ImportStatus } from '../models/ImportRequest';
 import { AdminAuditLog } from '../models/AdminAuditLog';
 import { IMPORT_FSM, ORDER_FSM } from '../config/stateMachine';
+import { readIdempotency, writeIdempotency } from '../utils/idempotency';
 
 export class AdminPartnerController {
   /**
@@ -64,10 +65,20 @@ export class AdminPartnerController {
   public static async resolveException(req: Request, res: Response) {
     const { id } = req.params;
     const { action, resolutionNote } = req.body; // action: 'PROCEED' | 'CANCEL'
+    const adminId = req.user?.userId;
+
+    // M3: Idempotency lookup — replay returns the stored response.
+    const lookupKey = `admin:${adminId}:resolve_exception:${id}:${action}:${req.idempotencyKey}`;
+    const existingReq = await readIdempotency(lookupKey);
+    if (existingReq) return res.json(existingReq.responseBody);
 
     const shipment = await ImportRequest.findById(id);
     if (!shipment) return res.status(404).json({ error: 'SHIPMENT_NOT_FOUND' });
 
+    // M2 NOTE — DOCUMENTED FSM EXCEPTION: CANCELLED is only FSM-reachable from
+    // DECLARED/RECEIVED_AT_ORIGIN. This is an admin exception-resolution escalation
+    // for flagged shipments (the FSM validator would reject any move on a flagged
+    // shipment), fully audited by the RESOLVE_IMPORT_EXCEPTION log below.
     if (action === 'CANCEL') {
       shipment.status = ImportStatus.CANCELLED;
     }
@@ -85,7 +96,9 @@ export class AdminPartnerController {
       requestId: req.id
     });
 
-    res.json({ success: true, message: 'Shipment unfrozen.' });
+    const responsePayload = { success: true, message: 'Shipment unfrozen.' };
+    await writeIdempotency(lookupKey, responsePayload);
+    res.json(responsePayload);
   }
 
   /**
@@ -97,11 +110,20 @@ export class AdminPartnerController {
   public static async adminForceState(req: Request, res: Response) {
     const { shipmentId } = req.params;
     const { newState, reason, bypassFSM, nextLocationId } = req.body;
+    const adminId = req.user?.userId;
+
+    // M3: Idempotency lookup — replay returns the stored response.
+    const lookupKey = `admin:${adminId}:force_state:${shipmentId}:${newState}:${req.idempotencyKey}`;
+    const existingReq = await readIdempotency(lookupKey);
+    if (existingReq) return res.json(existingReq.responseBody);
 
     const shipment = await ImportRequest.findById(shipmentId);
     if (!shipment) return res.status(404).json({ error: 'NOT_FOUND' });
 
     // "Break-Glass" Logic
+    // M2 NOTE: The standard path validates against IMPORT_FSM; the break-glass
+    // bypass is an intentional, audited escalation (BREAK_GLASS_STATE_OVERRIDE
+    // AdminAuditLog entry below) restricted to the FORCE_SHIPMENT_STATE capability.
     if (bypassFSM) {
       if (!nextLocationId) {
         return res.status(400).json({ error: 'LOCATION_REQUIRED_FOR_BYPASS' });
@@ -126,6 +148,8 @@ export class AdminPartnerController {
       requestId: req.id
     });
 
-    res.json({ success: true });
+    const responsePayload = { success: true };
+    await writeIdempotency(lookupKey, responsePayload);
+    res.json(responsePayload);
   }
 }

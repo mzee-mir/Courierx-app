@@ -78,6 +78,37 @@ export class WalletService {
     const updatedWallet = await Wallet.findOne({ userId: data.userId }).session(data.session);
     return { newBalance: updatedWallet?.balance || 0 };
   }
+
+  /**
+   * Releases escrow back to the customer when an order is cancelled/deleted.
+   * Idempotent: the ESCROW_REFUND:<orderId> ledger key guarantees a single refund.
+   * Guarded: refuses to run once the order has been settled (paymentSettled).
+   */
+  public static async releaseEscrow(data: {
+    order: any; // IOrder-like
+    reason: string;
+    requestId: string;
+    session: ClientSession;
+  }) {
+    const { order, reason, requestId, session } = data;
+
+    if (order.paymentSettled) {
+      return { skipped: true, reason: 'ALREADY_SETTLED' };
+    }
+
+    await this.transferFunds({
+      from: InternalAccount.SYSTEM_ESCROW,
+      to: order.customerId.toString(),
+      amount: order.price,
+      referenceId: order._id,
+      idempotencyKey: `ESCROW_REFUND:${order._id}`,
+      description: `Escrow refund for cancelled order ${order._id}. Reason: ${reason}`,
+      requestId,
+      session
+    });
+
+    return { skipped: false };
+  }
 }
 /**
 pricing: any; // From ImportRequest.pricingSnapshot

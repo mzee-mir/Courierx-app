@@ -1,9 +1,14 @@
 // routes/profileRoutes.ts
 import { Router } from 'express';
 import { ProfileController } from '../controllers/ProfileController';
-import { authenticate } from '../middleware/authMiddleware';
+import { authenticateHardened, hydrateIdentity } from '../middleware/authMiddleware';
 
 const router = Router();
+
+// HARDENED AUTH: Live session re-validation + token-version check on all profile calls.
+router.use(authenticateHardened);
+router.use(hydrateIdentity);
+
 /**
  * @route   GET /api/v1/profile
  * @desc    Retrieve the authenticated user's profile and saved landmarks
@@ -12,7 +17,6 @@ const router = Router();
 
 router.get(
   '/landmarks', 
-  authenticate, 
   ProfileController.getLandmarks
 );
 
@@ -23,7 +27,6 @@ router.get(
  */
 router.get(
   '/',
-  authenticate,
   ProfileController.getProfile
 );
 
@@ -34,7 +37,6 @@ router.get(
  */
 router.patch(
   '/',
-  authenticate,
   ProfileController.updateProfile
 );
 
@@ -45,18 +47,17 @@ router.patch(
  */
 router.post(
   '/landmarks',
-  authenticate,
   ProfileController.createLandmark
 );
 
-router.patch('/push-token', authenticate, ProfileController.updatePushToken);
+router.patch('/push-token', ProfileController.updatePushToken);
 
 /**
  * @route   PATCH /api/v1/profile/notification-preferences
  * @desc    Task 5.3b: Update per-event import notification preferences
  * @access  Private
  */
-router.patch('/notification-preferences', authenticate, ProfileController.updateNotificationPreferences);
+router.patch('/notification-preferences', ProfileController.updateNotificationPreferences);
 
 
 /**
@@ -66,7 +67,6 @@ router.patch('/notification-preferences', authenticate, ProfileController.update
  */
 router.delete(
   '/landmarks/:id',
-  authenticate,
   ProfileController.deleteLandmark
 );
 

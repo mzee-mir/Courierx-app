@@ -6,6 +6,7 @@ import mongoose from 'mongoose';
 import { Manifest } from '../models/Manifest';
 import { MANIFEST_FSM, ManifestStatus } from '../config/stateMachine';
 import { ShipmentLog } from '../models/ShipmentLog';
+import { readIdempotency, writeIdempotency } from '../utils/idempotency';
 
 export class AdminImportController {
 
@@ -14,8 +15,18 @@ export class AdminImportController {
    */
   public static async createPartner(req: Request, res: Response) {
     try {
+      const adminId = req.user?.userId;
+      const idempotencyKey = req.idempotencyKey;
+
+      // M3: Idempotency lookup — replay returns the stored response.
+      const lookupKey = `admin:${adminId}:create_partner:${idempotencyKey}`;
+      const existingReq = await readIdempotency(lookupKey);
+      if (existingReq) return res.status(201).json(existingReq.responseBody);
+
       const partner = await CargoPartner.create(req.body);
-      res.status(201).json({ success: true, partner });
+      const responsePayload = { success: true, partner };
+      await writeIdempotency(lookupKey, responsePayload);
+      res.status(201).json(responsePayload);
     } catch (error) {
       res.status(400).json({ error: 'CREATE_PARTNER_FAILED' });
     }
@@ -28,8 +39,14 @@ export class AdminImportController {
     const { requestId } = req.params;
     const { chinaAgentId, freightPartnerId, clearingAgentId } = req.body;
     const adminId = req.user?.userId;
+    const idempotencyKey = req.idempotencyKey;
 
     try {
+      // M3: Idempotency lookup — replay returns the stored response.
+      const lookupKey = `admin:${adminId}:assign_partners:${requestId}:${idempotencyKey}`;
+      const existingReq = await readIdempotency(lookupKey);
+      if (existingReq) return res.status(200).json(existingReq.responseBody);
+
       const request = await ImportRequest.findById(requestId);
       if (!request) return res.status(404).json({ error: 'IMPORT_NOT_FOUND' });
 
@@ -48,7 +65,9 @@ export class AdminImportController {
         details: `Assigned partners to shipment ${request.externalTrackingNumber}`,
       });
 
-      res.status(200).json({ success: true, request });
+      const responsePayload = { success: true, request };
+      await writeIdempotency(lookupKey, responsePayload);
+      res.status(200).json(responsePayload);
     } catch (error) {
       res.status(500).json({ error: 'ASSIGNMENT_FAILED' });
     }
@@ -62,9 +81,18 @@ export class AdminImportController {
     const { manifestCode, originHub, destinationHub, shippingMode, shipmentIds, metadata } = req.body;
     const adminId = req.user?.userId;
     const partnerId = req.user?.partnerId;
+    const idempotencyKey = req.idempotencyKey;
     const session = await mongoose.startSession();
 
     try {
+      // M3: Idempotency lookup — replay returns the stored response.
+      const lookupKey = `admin:${adminId}:consolidate:${idempotencyKey}`;
+      const existingReq = await readIdempotency(lookupKey);
+      if (existingReq) {
+        await session.endSession();
+        return res.status(201).json(existingReq.responseBody);
+      }
+
       await session.withTransaction(async () => {
         // 1. DATA INTEGRITY CHECK: Fetch all target shipments
         const shipments = await ImportRequest.find({
@@ -137,6 +165,13 @@ export class AdminImportController {
           notes: `Packed into Manifest: ${manifestCode}`
         }));
         await ShipmentLog.insertMany(shipmentEvents, { session });
+
+        const responseBody = {
+          success: true,
+          message: 'MANIFEST_LOCKED',
+          count: shipmentIds.length
+        };
+        await writeIdempotency(lookupKey, responseBody, session);
       });
 
       res.status(201).json({
@@ -210,6 +245,12 @@ export class AdminImportController {
   public static async initializeManifestDraft(req: Request, res: Response) {
     const { shippingMode, originHub, destinationHub } = req.body;
     const partnerId = req.user?.partnerId;
+    const adminId = req.user?.userId;
+
+    // M3: Idempotency lookup — replay returns the stored response.
+    const lookupKey = `partner:${partnerId}:init_manifest_draft:${originHub}:${destinationHub}:${req.idempotencyKey}`;
+    const existingReq = await readIdempotency(lookupKey);
+    if (existingReq) return res.status(201).json(existingReq.responseBody);
 
     // 1. VALIDATION GUARD: Check if IDs are valid ObjectIds
     if (!mongoose.Types.ObjectId.isValid(originHub) || !mongoose.Types.ObjectId.isValid(destinationHub)) {
@@ -230,7 +271,9 @@ export class AdminImportController {
         partnerId
       });
 
-      res.status(201).json({ success: true, draftId: draft._id });
+      const responsePayload = { success: true, draftId: draft._id };
+      await writeIdempotency(lookupKey, responsePayload);
+      res.status(201).json(responsePayload);
     } catch (error) {
       console.error("DRAFT_INIT_ERROR:", error);
       res.status(500).json({ error: 'DATABASE_WRITE_FAILED' });
@@ -243,6 +286,12 @@ export class AdminImportController {
   public static async updateManifestDraft(req: Request, res: Response) {
     const { id } = req.params;
     const { shipmentIds, metadata } = req.body;
+    const adminId = req.user?.userId;
+
+    // M3: Idempotency lookup — replay returns the stored response.
+    const lookupKey = `partner:${adminId}:update_manifest_draft:${id}:${req.idempotencyKey}`;
+    const existingReq = await readIdempotency(lookupKey);
+    if (existingReq) return res.json(existingReq.responseBody);
 
     // RULE: Only update if still in DRAFT status
     const draft = await Manifest.findOneAndUpdate(
@@ -252,7 +301,9 @@ export class AdminImportController {
     );
 
     if (!draft) return res.status(400).json({ error: 'MANIFEST_ALREADY_SEALED' });
-    res.json({ success: true, draft });
+    const responsePayload = { success: true, draft };
+    await writeIdempotency(lookupKey, responsePayload);
+    res.json(responsePayload);
   }
 
   public static async getManifestAuthority(req: Request, res: Response) {
@@ -317,6 +368,13 @@ export class AdminImportController {
 
   public static async sealManifest(req: Request, res: Response) {
     const { id } = req.params;
+    const adminId = req.user?.userId;
+
+    // M3: Idempotency lookup — replay returns the stored response.
+    const lookupKey = `partner:${adminId}:seal_manifest:${id}:${req.idempotencyKey}`;
+    const existingReq = await readIdempotency(lookupKey);
+    if (existingReq) return res.json(existingReq.responseBody);
+
     const session = await mongoose.startSession();
 
     try {
@@ -331,6 +389,22 @@ export class AdminImportController {
         // 2. PARENT UPDATE
         manifest.status = 'CONSOLIDATED' as any; // Using your ManifestStatus enum
         await manifest.save({ session });
+
+        // M2 — FSM GATE: only RECEIVED_AT_ORIGIN shipments may be consolidated
+        // (RECEIVED_AT_ORIGIN → CONSOLIDATED is the only legal path in IMPORT_FSM).
+        // Prevents a DRAFT from force-moving DECLARED (never-intaken) shipments.
+        const children = await ImportRequest.find({ _id: { $in: manifest.shipmentIds } })
+          .select('status isFlagged')
+          .session(session);
+
+        for (const child of children) {
+          if (child.status !== ImportStatus.RECEIVED_AT_ORIGIN) {
+            throw new Error(`FLOW_ERROR: Shipment ${child._id} is not in RECEIVED state.`);
+          }
+          if (child.isFlagged) {
+            throw new Error(`SECURITY_LOCK: Shipment ${child._id} is frozen and cannot be consolidated.`);
+          }
+        }
 
         // 3. 🛡️ BATCH PROPAGATION: The most important step
         // Update ALL individual packages inside the manifest to 'CONSOLIDATED'
@@ -349,6 +423,9 @@ export class AdminImportController {
           details: `Batch sealed with ${manifest.shipmentIds.length} items.`,
           requestId: req.id
         }], { session });
+
+        const responseBody = { success: true, message: 'MANIFEST_SEALED_SUCCESSFULLY' };
+        await writeIdempotency(lookupKey, responseBody, session);
       });
 
       res.status(200).json({ success: true, message: 'MANIFEST_SEALED_SUCCESSFULLY' });
@@ -387,6 +464,12 @@ export class AdminImportController {
     const { id } = req.params;
     const actionTrigger = req.body.actionCode || req.body.nextStatus;
     const user = req.user!;
+
+    // M3: Idempotency lookup — replay returns the stored response.
+    const lookupKey = `partner:${user.userId}:transition_manifest:${id}:${actionTrigger}:${req.idempotencyKey}`;
+    const existingReq = await readIdempotency(lookupKey);
+    if (existingReq) return res.status(200).json(existingReq.responseBody);
+
     const session = await mongoose.startSession();
 
     try {
@@ -413,6 +496,14 @@ export class AdminImportController {
         else if (actionTrigger.includes('DISMANTLE')) targetState = ManifestStatus.DISMANTLED;
         else targetState = actionTrigger as ManifestStatus;
 
+        // M2 — FSM GATE: the manifest itself must move along MANIFEST_FSM.
+        // Prevents e.g. a DRAFT jumping straight to DEPARTED (skipping the
+        // CONSOLIDATED seal) or a DEPARTED manifest being 're-arrived' twice.
+        const manifestAllowed = MANIFEST_FSM[manifest.status as ManifestStatus];
+        if (!manifestAllowed || !manifestAllowed.includes(targetState)) {
+          throw new Error(`FSM_VIOLATION: Cannot move manifest from ${manifest.status} to ${targetState}.`);
+        }
+
         const oldStatus = manifest.status;
         manifest.status = targetState;
         await manifest.save({ session });
@@ -434,6 +525,23 @@ export class AdminImportController {
         }
 
         if (Object.keys(shipmentUpdate).length > 0) {
+          // M2 — FSM GATE: child shipments must be in the FSM-valid predecessor
+          // before batch propagation (CONSOLIDATED → IN_TRANSIT on DEPART,
+          // IN_TRANSIT → ARRIVED_LOCAL on ARRIVE). No child may jump ahead.
+          const requiredPrevStatus = targetState === ManifestStatus.DEPARTED
+            ? ImportStatus.CONSOLIDATED
+            : ImportStatus.IN_TRANSIT;
+
+          const children = await ImportRequest.find({ _id: { $in: manifest.shipmentIds } })
+            .select('status')
+            .session(session);
+
+          for (const child of children) {
+            if (child.status !== requiredPrevStatus) {
+              throw new Error(`FLOW_ERROR: Shipment ${child._id} must be ${requiredPrevStatus} before this transition.`);
+            }
+          }
+
           await ImportRequest.updateMany(
             { _id: { $in: manifest.shipmentIds } },
             { $set: shipmentUpdate },
@@ -449,6 +557,9 @@ export class AdminImportController {
           details: `Batch moved from ${oldStatus} to ${targetState} by ${user.name}`,
           requestId: req.id
         }], { session });
+
+        const responseBody = { success: true };
+        await writeIdempotency(lookupKey, responseBody, session);
       });
 
       res.status(200).json({ success: true });

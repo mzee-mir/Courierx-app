@@ -1,10 +1,25 @@
 // routes/orderRoutes.ts
 import { Router } from 'express';
 import { OrderController } from '../controllers/OrderController';
-import { authenticate, authorize, authorizeDriver } from '../middleware/authMiddleware';
+import { authenticateHardened, hydrateIdentity, authorize, authorizeDriver } from '../middleware/authMiddleware';
+import { validate } from '../middleware/validate';
 import { UserRole } from '../models/User';
+import { createOrderSchema, acceptOrderSchema, updateOrderStatusSchema, verifyOrderSchema } from '../validations/order.validation';
+import { mutationLimiter } from '../middleware/rateLimiter';
 
 const router = Router();
+
+/**
+ * HARDENED IDENTITY (M6): Every order route re-reads the user from the DB.
+ * - authenticateHardened re-fetches roles from the DB (demotions take effect immediately).
+ * - hydrateIdentity re-checks suspension + tokenVersion and refreshes
+ *   partnerId/assignedLocations.
+ * isVerified is intentionally NOT overwritten here — authorizeDriver keeps reading
+ * it from the JWT, which preserves the driver-onboarding gate (a freshly verified
+ * driver must re-login to obtain an isVerified:true token).
+ */
+router.use(authenticateHardened);
+router.use(hydrateIdentity);
 
 
 /**
@@ -14,7 +29,6 @@ const router = Router();
  */
 router.get(
   '/',
-  authenticate,
   authorize([UserRole.CUSTOMER]),
   OrderController.getMyOrders
 );
@@ -26,7 +40,6 @@ router.get(
  */
 router.get(
   '/:id', 
-  authenticate, 
   // ✅ FIX: Include UserRole.DRIVER in the allowed array
   authorize([UserRole.CUSTOMER, UserRole.DRIVER]), 
   OrderController.getOrderById
@@ -38,8 +51,8 @@ router.get(
  */
 router.post(
   '/',
-  authenticate,
   authorize([UserRole.CUSTOMER]),
+  validate(createOrderSchema),
   OrderController.create
 );
 
@@ -50,9 +63,31 @@ router.post(
  */
 router.patch(
   '/:id/accept',
-  authenticate,
   authorizeDriver,
+  validate(acceptOrderSchema),
   OrderController.accept
+);
+
+/**
+ * @route   POST /api/v1/orders/:id/offers/reject
+ * @desc    Driver explicitly declines an active targeted offer
+ * @access  Private/Driver
+ */
+router.post(
+  '/:id/offers/reject',
+  authorizeDriver,
+  OrderController.rejectOffer
+);
+
+/**
+ * @route   POST /api/v1/orders/:id/offers/seen
+ * @desc    Driver app confirms the offer was rendered/seen on screen
+ * @access  Private/Driver
+ */
+router.post(
+  '/:id/offers/seen',
+  authorizeDriver,
+  OrderController.seenOffer
 );
 
 /**
@@ -62,8 +97,8 @@ router.patch(
  */
 router.patch(
   '/:id/status', 
-  authenticate, 
   authorizeDriver, // This checks 'isVerified' in the JWT
+  validate(updateOrderStatusSchema),
   OrderController.updateStatus
 );
 
@@ -74,14 +109,36 @@ router.patch(
  */
 router.post(
   '/:id/verify',
-  authenticate,
   authorizeDriver,
+  validate(verifyOrderSchema),
+  mutationLimiter, // Prevents PIN brute-force and drive-by settlement attempts
   OrderController.verifyAndComplete
+);
+
+/**
+ * @route   GET /api/v1/orders/:id/pin
+ * @desc    Owner-only: retrieve the delivery PIN for the recipient
+ * @access  Private/Customer (order owner)
+ */
+router.get(
+  '/:id/pin',
+  authorize([UserRole.CUSTOMER]),
+  OrderController.getOrderPin
+);
+
+/**
+ * @route   POST /api/v1/orders/:id/landmark-feedback
+ * @desc    Driver submits 1-tap post-delivery landmark accuracy feedback
+ * @access  Private/Driver
+ */
+router.post(
+  '/:id/landmark-feedback',
+  authorizeDriver,
+  OrderController.submitLandmarkFeedback
 );
 
 router.delete(
   '/:id', 
-  authenticate, 
   authorize([UserRole.CUSTOMER]), 
   OrderController.deleteOrder
 );

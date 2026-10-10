@@ -6,7 +6,8 @@ import { OrderStatus } from '../enums/OrderEnums';
  * Governs Bajaj, Car, and Truck logistics within Somalia.
  */
 export const ORDER_FSM: Record<OrderStatus, OrderStatus[]> = {
-  [OrderStatus.PENDING]: [OrderStatus.ACCEPTED, OrderStatus.CANCELLED],
+  [OrderStatus.PENDING]: [OrderStatus.ACCEPTED, OrderStatus.CHAINED_RESERVED, OrderStatus.CANCELLED],
+  [OrderStatus.CHAINED_RESERVED]: [OrderStatus.ACCEPTED, OrderStatus.CANCELLED],
   [OrderStatus.ACCEPTED]: [OrderStatus.ARRIVED_AT_PICKUP, OrderStatus.CANCELLED],
   [OrderStatus.ARRIVED_AT_PICKUP]: [OrderStatus.PICKED_UP],
   [OrderStatus.PICKED_UP]: [OrderStatus.ARRIVED_AT_DROPOFF],
@@ -39,7 +40,15 @@ export const IMPORT_FSM: Record<ImportStatus, ImportStatus[]> = {
   [ImportStatus.HANDED_OFF]: [ImportStatus.DELIVERED],
   [ImportStatus.DELIVERED]: [],
   [ImportStatus.CANCELLED]: [],
-  [ImportStatus.EXCEPTION]: []
+  [ImportStatus.EXCEPTION]: [],
+
+  // --- EXCEPTIONAL / HOLD STATES (terminal until manually resolved) ---
+  [ImportStatus.WEIGHT_DISPUTE]: [],
+  [ImportStatus.CUSTOMS_HOLD]: [],
+  [ImportStatus.LOST]: [],
+  [ImportStatus.RETURN_TO_SENDER]: [],
+  [ImportStatus.EXPIRED]: [],
+  [ImportStatus.PENDING_CUSTOMER_ACTION]: [],
 };
 
 /**

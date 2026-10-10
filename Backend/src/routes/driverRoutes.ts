@@ -1,12 +1,20 @@
 // routes/driverRoutes.ts
 import { Router } from 'express';
 import { DriverController } from '../controllers/DriverController';
-import { authenticate, authorize, authorizeDriver } from '../middleware/authMiddleware';
+import { authenticateHardened, authorize, authorizeDriver, hydrateIdentity } from '../middleware/authMiddleware';
 import { UserRole } from '../models/User';
 import { ProfileController } from '../controllers/ProfileController';
 import { OrderController } from '../controllers/OrderController';
+import { validate } from '../middleware/validate';
+import { toggleStatusSchema, updateLocationSchema } from '../validations/driver.validation';
 
 const router = Router();
+
+// --- HARDENED AUTH: Live session re-validation + token-version check on every driver call.
+// Soft-gate preserved: routes below omit `authorizeDriver` so unverified drivers can still
+// submit onboarding docs and check their verification status.
+router.use(authenticateHardened);
+router.use(hydrateIdentity);
 
 /**
  * @route GET /api/v1/driver/profile
@@ -14,15 +22,14 @@ const router = Router();
  */
 router.get(
   '/profile', 
-  authenticate, // User must be logged in
   // Note: We don't use authorizeDriver here so unverified 
   // drivers can check their status
   ProfileController.getDriverProfile 
 );
 
-router.get('/dashboard', authenticate, authorizeDriver, OrderController.getDriverDashboard);
+router.get('/dashboard', authorizeDriver, OrderController.getDriverDashboard);
 
-router.get('/orders', authenticate, authorizeDriver, OrderController.getDriverOrders);
+router.get('/orders', authorizeDriver, OrderController.getDriverOrders);
 
 /**
  * @route POST /api/v1/driver/profile
@@ -31,7 +38,6 @@ router.get('/orders', authenticate, authorizeDriver, OrderController.getDriverOr
  */
 router.post(
   '/profile', 
-  authenticate, // User must be logged in
   // Note: We do NOT use authorizeDriver here because the driver 
   // isn't verified yet!
   ProfileController.submitDriverOnboarding 
@@ -44,14 +50,13 @@ router.post(
  */
 router.post(
   '/location',
-  authenticate,
   authorize([UserRole.DRIVER]),
+  validate(updateLocationSchema),
   DriverController.updateLocation
 );
 
 router.patch(
   '/driver/profile/avatar', 
-  authenticate, 
   ProfileController.updateDriverAvatar
 );
 
@@ -62,7 +67,6 @@ router.patch(
  */
 router.get(
   '/nearby', 
-  authenticate, 
   // Note: We do NOT use authorizeDriver here because 
   // Customers need to call this to see the map!
   DriverController.getNearbyDrivers
@@ -76,8 +80,8 @@ router.get(
  */
 router.patch(
   '/status',
-  authenticate,      // 1. Who are you?
   authorizeDriver,   // 2. Are you a verified driver?
+  validate(toggleStatusSchema),
   DriverController.toggleStatus
 );
 

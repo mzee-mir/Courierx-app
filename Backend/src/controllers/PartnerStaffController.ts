@@ -4,6 +4,7 @@ import { User, UserRole } from '../models/User';
 import { AdminAuditLog } from '../models/AdminAuditLog';
 import mongoose from 'mongoose';
 import { redactUser } from '../utils/redact';
+import { readIdempotency, writeIdempotency } from '../utils/idempotency';
 
 
 export class PartnerStaffController {
@@ -14,9 +15,14 @@ export class PartnerStaffController {
     // 1. Capture permissions from the request body
     const { email, password, displayName, assignedLocations, permissions } = req.body;
     const ownerPartnerId = req.user?.partnerId;
-
+    const idempotencyKey = req.idempotencyKey;
 
     try {
+      // M3: Idempotency lookup — replay returns the stored response.
+      const lookupKey = `partner:${ownerPartnerId}:create_worker:${idempotencyKey}`;
+      const existingReq = await readIdempotency(lookupKey);
+      if (existingReq) return res.status(201).json(existingReq.responseBody);
+
       const hashedPassword = await bcrypt.hash(password, 12);
 
 
@@ -33,8 +39,9 @@ export class PartnerStaffController {
         firebaseUid: `PTR_INTERNAL_${Date.now()}`
       });
 
-
-      res.status(201).json({ success: true, workerId: newWorker._id });
+      const responsePayload = { success: true, workerId: newWorker._id };
+      await writeIdempotency(lookupKey, responsePayload);
+      res.status(201).json(responsePayload);
     } catch (error) {
       res.status(500).json({ error: 'WORKER_CREATION_FAILED' });
     }
@@ -72,9 +79,15 @@ export class PartnerStaffController {
     const { id } = req.params; // The Worker's User ID
     const { isSuspended } = req.body;
     const ownerPartnerId = req.user?.partnerId;
+    const idempotencyKey = req.idempotencyKey;
 
 
     try {
+      // M3: Idempotency lookup — replay returns the stored response.
+      const lookupKey = `partner:${ownerPartnerId}:toggle_worker:${id}:${idempotencyKey}`;
+      const existingReq = await readIdempotency(lookupKey);
+      if (existingReq) return res.status(200).json(existingReq.responseBody);
+
       // 1. ATOMIC UPDATE: Flip suspension AND burn the current session token
       const worker = await User.findOneAndUpdate(
         { _id: id, partnerId: ownerPartnerId }, // 👈 Hard-scoped to Owner's Org
@@ -99,8 +112,9 @@ export class PartnerStaffController {
         requestId: req.id
       });
 
-
-      res.json({ success: true, isSuspended: worker.isSuspended });
+      const responsePayload = { success: true, isSuspended: worker.isSuspended };
+      await writeIdempotency(lookupKey, responsePayload);
+      res.json(responsePayload);
     } catch (error) {
       res.status(500).json({ error: 'STATUS_UPDATE_FAILED' });
     }
@@ -114,7 +128,12 @@ export class PartnerStaffController {
     try {
       const { displayName, imageUrl } = req.body;
       const userId = req.user?.userId;
+      const idempotencyKey = req.idempotencyKey;
 
+      // M3: Idempotency lookup — replay returns the stored response.
+      const lookupKey = `user:${userId}:self_profile:${idempotencyKey}`;
+      const existingReq = await readIdempotency(lookupKey);
+      if (existingReq) return res.status(200).json(existingReq.responseBody);
 
       const user = await User.findByIdAndUpdate(
         userId,
@@ -122,8 +141,9 @@ export class PartnerStaffController {
         { new: true }
       );
 
-
-      res.json({ success: true, user: redactUser(user) });
+      const responsePayload = { success: true, user: redactUser(user) };
+      await writeIdempotency(lookupKey, responsePayload);
+      res.json(responsePayload);
     } catch (error) {
       res.status(500).json({ error: 'PROFILE_UPDATE_FAILED' });
     }
@@ -136,7 +156,12 @@ export class PartnerStaffController {
   public static async updateSelfPassword(req: Request, res: Response) {
     const { currentPassword, newPassword } = req.body;
     const userId = req.user?.userId;
+    const idempotencyKey = req.idempotencyKey;
 
+    // M3: Idempotency lookup — replay returns the stored response.
+    const lookupKey = `user:${userId}:self_password:${idempotencyKey}`;
+    const existingReq = await readIdempotency(lookupKey);
+    if (existingReq) return res.status(200).json(existingReq.responseBody);
 
     const user = await User.findById(userId).select('+password');
     if (!user || !(await bcrypt.compare(currentPassword, user.password || ''))) {
@@ -148,8 +173,9 @@ export class PartnerStaffController {
     user.tokenVersion += 1; // 👈 Forces re-login on all devices
     await user.save();
 
-
-    res.json({ success: true, message: 'Password updated. Please log in again.' });
+    const responsePayload = { success: true, message: 'Password updated. Please log in again.' };
+    await writeIdempotency(lookupKey, responsePayload);
+    res.json(responsePayload);
   }
 
 
@@ -196,9 +222,15 @@ export class PartnerStaffController {
     const { id } = req.params; // The Worker's User ID
     const { permissions } = req.body; // The new list of keys
     const ownerPartnerId = req.user?.partnerId;
+    const idempotencyKey = req.idempotencyKey;
 
 
     try {
+      // M3: Idempotency lookup — replay returns the stored response.
+      const lookupKey = `partner:${ownerPartnerId}:worker_permissions:${id}:${idempotencyKey}`;
+      const existingReq = await readIdempotency(lookupKey);
+      if (existingReq) return res.status(200).json(existingReq.responseBody);
+
       // 1. Security Check: Ensure the target worker belongs to the Boss's organization
       const worker = await User.findOneAndUpdate(
         { _id: id, partnerId: ownerPartnerId },
@@ -220,8 +252,9 @@ export class PartnerStaffController {
         requestId: req.id
       });
 
-
-      res.json({ success: true, permissions: worker.permissions });
+      const responsePayload = { success: true, permissions: worker.permissions };
+      await writeIdempotency(lookupKey, responsePayload);
+      res.json(responsePayload);
     } catch (error) {
       res.status(500).json({ error: 'UPDATE_FAILED' });
     }

@@ -51,7 +51,7 @@ export class AdminFinanceController {
           userId: tx.userId.toString(),
           amount: tx.amount,
           type: 'deposit',
-          metadata: { externalReference: tx.externalReference },
+          metadata: { externalReference: tx.externalReference, requestId: req.id },
           session
         });
 
@@ -219,6 +219,11 @@ export class AdminFinanceController {
     const { transactionId } = req.params;
     const adminId = req.user?.userId;
 
+    // M3: Idempotency lookup — replay returns the stored response.
+    const lookupKey = `admin:${adminId}:complete_withdrawal:${transactionId}:${req.idempotencyKey}`;
+    const existingReq = await Idempotency.findOne({ key: lookupKey });
+    if (existingReq) return res.status(200).json(existingReq.responseBody);
+
     const session = await mongoose.startSession();
     session.startTransaction();
 
@@ -239,8 +244,16 @@ export class AdminFinanceController {
         details: `Processed $${tx.amount} payout to EVC+ number linked to user.`,
       }], { session });
 
+      const responsePayload = { success: true, message: 'PAYOUT_RECORDS_UPDATED' };
+
+      await Idempotency.create([{
+        key: lookupKey,
+        responseBody: responsePayload,
+        expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000)
+      }], { session });
+
       await session.commitTransaction();
-      res.status(200).json({ success: true, message: 'PAYOUT_RECORDS_UPDATED' });
+      res.status(200).json(responsePayload);
     } catch (error: any) {
       await session.abortTransaction();
       res.status(500).json({ error: error.message || 'PAYOUT_FAILED' });

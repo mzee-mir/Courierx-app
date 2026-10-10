@@ -4,6 +4,9 @@ import { OrderService } from './OrderService';
 import { ShipmentLog } from '../models/ShipmentLog';
 import { VehicleType } from '../enums/OrderEnums'; // 👈 Import the Enum
 import { Order } from '../models/Order';
+import { WalletService } from './WalletService';
+import { InternalAccount } from '../config/accounts';
+import { IMPORT_FSM } from '../config/stateMachine';
 
 export class ImportService {
 
@@ -11,6 +14,10 @@ private static readonly VIRTUAL_TRANSIT_NODE_ID = "507f1f77bcf86cd799439011"; //
 
   /**
    * updateStatus: Synchronizes state with physical location nodes.
+   * M2: Every write is gated by IMPORT_FSM (no direct status mutation bypass).
+   * NOTE: physical custody is NOT re-validated here because this service receives
+   * no user context — callers must enforce custody via the enforceCustody
+   * middleware (Location determines Authority).
    */
   public static async updateStatus(data: {
     shipmentId: string,
@@ -19,18 +26,24 @@ private static readonly VIRTUAL_TRANSIT_NODE_ID = "507f1f77bcf86cd799439011"; //
     session: ClientSession
   }) {
     // RULE 2: Digital/Physical Sync
+    const shipment = await ImportRequest.findById(data.shipmentId).session(data.session);
+    if (!shipment) throw new Error('SHIPMENT_NOT_FOUND');
+
+    const allowed = IMPORT_FSM[shipment.status as ImportStatus];
+    if (!allowed || !allowed.includes(data.newStatus)) {
+      throw new Error(`FSM_VIOLATION: Cannot move from ${shipment.status} to ${data.newStatus}.`);
+    }
+
     const update = {
       status: data.newStatus,
       locationId: data.newLocationId 
     };
 
-    const shipment = await ImportRequest.findOneAndUpdate(
+    return await ImportRequest.findOneAndUpdate(
       { _id: data.shipmentId },
       { $set: update },
       { session: data.session, new: true }
     );
-
-    return shipment;
   }
 
   /**
@@ -61,17 +74,20 @@ private static readonly VIRTUAL_TRANSIT_NODE_ID = "507f1f77bcf86cd799439011"; //
         const assignedVehicle = vehicleMapping[shipment.preferredLocalVehicle] || VehicleType.BAJAJ;
 
         // Create local CourierX Order
-        await OrderService.createOrder({
+        const localOrder = await OrderService.createOrder({
           customerId: shipment.userId.toString(),
           pickupLandmark: "Mogadishu Port - CourierX Terminal",
-          pickupLocation: { type: 'Point', coordinates: [45.33, 2.03] }, 
+          pickupLocation: { type: 'Point', coordinates: [45.33, 2.03] },
           dropoffLandmark: shipment.dropoffLandmark,
           dropoffLocation: shipment.dropoffLocation,
-          vehicleType: assignedVehicle, // 👈 Now matches the Enum type
-          distanceKm: 5, 
-          // @ts-ignore - assuming importReferenceId was added to Order schema in previous steps
-          importReferenceId: shipment._id 
+          vehicleType: assignedVehicle // 👈 Now matches the Enum type
         });
+
+        await Order.updateOne(
+          { _id: localOrder._id },
+          { $set: { importShipmentId: shipment._id } },
+          { session }
+        );
 
         await ShipmentLog.create([{
           importRequestId: shipment._id,
@@ -144,6 +160,32 @@ private static readonly VIRTUAL_TRANSIT_NODE_ID = "507f1f77bcf86cd799439011"; //
 
         // 3. CREATE LOCAL ORDER (The "CourierX" side)
         // We use the snapshot data so the local order is independent of future profile changes
+        const vehicleMapping: Record<string, VehicleType> = {
+          'bajaj': VehicleType.BAJAJ,
+          'car': VehicleType.CAR,
+          'truck': VehicleType.TRUCK
+        };
+        const assignedVehicle = vehicleMapping[shipment.preferredLocalVehicle] || VehicleType.BAJAJ;
+
+        // Server-computed pricing (I8): distance from coordinates, no client trust.
+        const { price, commission } = OrderService.calculatePricingForOrder(
+          assignedVehicle,
+          [45.3182, 2.0469], // Terminal GPS
+          shipment.resolverSnapshot?.deliveryCoords || [45.3182, 2.0469]
+        );
+
+        // FUND ESCROW (I4): debit the customer wallet before the local order can pay out.
+        await WalletService.transferFunds({
+          from: shipment.userId.toString(),
+          to: InternalAccount.SYSTEM_ESCROW,
+          amount: price,
+          referenceId: shipment._id,
+          idempotencyKey: `LOCAL_ESCROW:${shipment._id}`,
+          description: `Escrow for local delivery of import ${shipment._id}`,
+          requestId: `handoff-${shipment._id}`,
+          session
+        });
+
         const localOrder = await Order.create([{
           customerId: shipment.userId,
           pickupLandmark: "CourierX Somalia Terminal",
@@ -153,10 +195,10 @@ private static readonly VIRTUAL_TRANSIT_NODE_ID = "507f1f77bcf86cd799439011"; //
             type: 'Point',
             coordinates: shipment.resolverSnapshot?.deliveryCoords
           },
-          vehicleType: shipment.preferredLocalVehicle,
-          price: 5.00, // Fixed last-mile fee or calculated
-          commission: 0.75,
-          verificationPin: Math.floor(1000 + Math.random() * 9000).toString(),
+          vehicleType: assignedVehicle,
+          price,
+          commission,
+          verificationPin: OrderService.generatePin(),
           importShipmentId: shipment._id // 👈 Idempotency link
         }], { session });
 
@@ -189,6 +231,9 @@ private static readonly VIRTUAL_TRANSIT_NODE_ID = "507f1f77bcf86cd799439011"; //
 
   /**
    * RULE 3: Coupled State/Location Updates
+   * M2: Every write is gated by IMPORT_FSM (no direct status mutation bypass).
+   * NOTE: physical custody is enforced by the calling layer (enforceCustody),
+   * since this service has no user context.
    */
   public static async transitionStatus(data: {
     shipmentId: string,
@@ -196,6 +241,14 @@ private static readonly VIRTUAL_TRANSIT_NODE_ID = "507f1f77bcf86cd799439011"; //
     targetLocationId?: string,
     session: ClientSession
   }) {
+    const shipment = await ImportRequest.findById(data.shipmentId).session(data.session);
+    if (!shipment) throw new Error('SHIPMENT_NOT_FOUND');
+
+    const allowed = IMPORT_FSM[shipment.status as ImportStatus];
+    if (!allowed || !allowed.includes(data.newStatus)) {
+      throw new Error(`FSM_VIOLATION: Cannot move from ${shipment.status} to ${data.newStatus}.`);
+    }
+
     const update: any = { status: data.newStatus };
 
     // Automatic Location Management

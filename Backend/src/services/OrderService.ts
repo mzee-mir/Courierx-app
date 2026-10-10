@@ -5,6 +5,9 @@ import { Wallet } from '../models/Wallet';
 import { Transaction } from '../models/Transaction';
 import { OrderStatus, VehicleType } from '../enums/OrderEnums';
 import { ORDER_FSM } from '../config/stateMachine';
+import { WalletService } from './WalletService';
+import { InternalAccount } from '../config/accounts';
+import { LandmarkService } from './LandmarkService';
 
 export class OrderService {
   /**
@@ -13,6 +16,37 @@ export class OrderService {
    */
   public static generatePin(): string {
     return Math.floor(1000 + Math.random() * 9000).toString();
+  }
+
+  /**
+   * Calculates the great-circle distance (km) between two GPS points using the
+   * haversine formula. Server-side only — the client never supplies distance.
+   */
+  public static haversineKm(a: [number, number], b: [number, number]): number {
+    const [lon1, lat1] = a;
+    const [lon2, lat2] = b;
+    const toRad = (deg: number) => (deg * Math.PI) / 180;
+    const R = 6371;
+    const dLat = toRad(lat2 - lat1);
+    const dLon = toRad(lon2 - lon1);
+    const h =
+      Math.sin(dLat / 2) ** 2 +
+      Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+    return R * 2 * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h));
+  }
+
+  /**
+   * Calculates pricing from GPS coordinates.
+   * Distance is computed server-side; client-supplied distanceKm is never trusted.
+   */
+  public static calculatePricingForOrder(
+    vehicleType: VehicleType,
+    pickupCoords: [number, number],
+    dropoffCoords: [number, number]
+  ) {
+    const distanceKm = this.haversineKm(pickupCoords, dropoffCoords);
+    const pricing = this.calculatePricing(vehicleType, distanceKm);
+    return { ...pricing, distanceKm: Number(distanceKm.toFixed(2)) };
   }
 
   /**
@@ -38,7 +72,7 @@ export class OrderService {
 
   /**
    * Creates an order in PENDING state.
-   * No funds are deducted from the customer at this stage.
+   * Pricing is computed server-side from the supplied coordinates.
    */
   public static async createOrder(data: {
     customerId: string;
@@ -47,9 +81,12 @@ export class OrderService {
     dropoffLocation: { type: 'Point'; coordinates: [number, number] };
     dropoffLandmark: string;
     vehicleType: VehicleType;
-    distanceKm: number;
   }): Promise<IOrder> {
-    const { price, commission } = this.calculatePricing(data.vehicleType, data.distanceKm);
+    const { price, commission } = this.calculatePricingForOrder(
+      data.vehicleType,
+      data.pickupLocation.coordinates,
+      data.dropoffLocation.coordinates
+    );
     const verificationPin = this.generatePin();
 
     const order = await Order.create({
@@ -104,48 +141,122 @@ export class OrderService {
   }
 
   /**
-   * Executes atomic wallet settlement using a MongoDB Session.
-   * Logic: Correct PIN -> -Customer Wallet -> +Driver Wallet -> Complete Order.
+   * Executes the single, idempotent settlement path.
+   * Guards (all enforced inside one session):
+   *   - Driver ownership: only the assigned driver may settle.
+   *   - FSM: order must be ARRIVED_AT_DROPOFF.
+   *   - PIN: recipient-provided PIN must match.
+   *   - paymentSettled: prevents double-pay.
+   * Wallet moves (escrow → driver, escrow → revenue) are ledger-backed and keyed.
    */
-  public static async verifyAndSettle(orderId: string, inputPin: string): Promise<void> {
+  public static async verifyAndSettle(orderId: string, inputPin: string, driverId: string): Promise<void> {
     const session = await mongoose.startSession();
     session.startTransaction();
 
     try {
-      const order = await Order.findById(orderId).session(session);
+      const order = await Order.findById(orderId)
+        .session(session)
+        .select('+verificationPin');
 
       if (!order) throw new Error('ORDER_NOT_FOUND');
 
-      /**
-       * ✅ DIAGNOSTIC LOGS:
-       * Check your backend terminal to see these values.
-       */
-      console.log(`VERIFICATION_ATTEMPT: Order ${orderId}`);
-      console.log(`DB_PIN: "${order.verificationPin}" | INPUT_PIN: "${inputPin}"`);
-      console.log(`CURRENT_STATUS: ${order.status}`);
+      // 0. Ownership: only the assigned driver may settle this order.
+      if (!order.driverId || order.driverId.toString() !== driverId) {
+        throw new Error('NOT_ASSIGNED_DRIVER');
+      }
 
-      // 1. Logic Check: Must be at destination
-      if (order.status !== 'ARRIVED_AT_DROPOFF') {
+      // 1. FSM check: must be at destination.
+      if (order.status !== OrderStatus.ARRIVED_AT_DROPOFF) {
         throw new Error('ORDER_NOT_AT_DESTINATION');
       }
 
-      // 2. Value Check: Trim both to prevent whitespace errors
-      if (order.verificationPin.trim() !== inputPin.trim()) {
+      // 2. PIN check (trim both to prevent whitespace errors).
+      if (order.verificationPin.trim() !== String(inputPin).trim()) {
         throw new Error('INVALID_PIN');
       }
 
+      // 3. Double-payment guard.
       if (order.paymentSettled) throw new Error('ALREADY_SETTLED');
 
-      // ... rest of the settlement logic (Wallet updates) remains same ...
-      // (Deduct from customer, credit driver, record transactions)
+      // 4. Move escrow → driver earnings and escrow → system commission.
+      await WalletService.transferFunds({
+        from: InternalAccount.SYSTEM_ESCROW,
+        to: order.driverId.toString(),
+        amount: order.price - order.commission,
+        referenceId: order._id,
+        idempotencyKey: `PAYOUT:${order._id}`,
+        description: `Driver earnings for Order ${order._id}`,
+        requestId: `order-settle-${orderId}`,
+        session
+      });
 
+      await WalletService.transferFunds({
+        from: InternalAccount.SYSTEM_ESCROW,
+        to: InternalAccount.SYSTEM_REVENUE,
+        amount: order.commission,
+        referenceId: order._id,
+        idempotencyKey: `COMMISSION:${order._id}`,
+        description: `System commission for Order ${order._id}`,
+        requestId: `order-settle-${orderId}`,
+        session
+      });
+
+      // 5. Commit state.
       order.status = OrderStatus.DELIVERED;
       order.paymentSettled = true;
+      order.settledAt = new Date();
       await order.save({ session });
 
-      await session.commitTransaction();
-      console.log(`VERIFICATION_SUCCESS: Order ${orderId} settled.`);
+      // 6. Connect DriverLandmarkStat and SystemLandmark to successful delivery
+      if (order.dropoffLandmarkId) {
+        await LandmarkService.recordSuccessfulDelivery(order.driverId, order.dropoffLandmarkId, session);
+      }
+      if (
+        order.pickupLandmarkId &&
+        (!order.dropoffLandmarkId || order.pickupLandmarkId.toString() !== order.dropoffLandmarkId.toString())
+      ) {
+        await LandmarkService.recordSuccessfulDelivery(order.driverId, order.pickupLandmarkId, session);
+      }
 
+      // 7. Auto-activate any chained order assigned to this driver
+      let activatedChainedOrder: any = null;
+      const chainedOrder = await Order.findOne({
+        driverId: order.driverId,
+        status: OrderStatus.CHAINED_RESERVED,
+      }).session(session);
+
+      if (chainedOrder) {
+        chainedOrder.status = OrderStatus.ACCEPTED;
+        chainedOrder.isChained = false;
+        await chainedOrder.save({ session });
+        activatedChainedOrder = chainedOrder;
+      }
+
+      await session.commitTransaction();
+
+      // Post-commit: Cancel unchain timeout and emit socket notifications
+      if (activatedChainedOrder && order.driverId) {
+        try {
+          const { cancelUnchainTimeout } = await import('../queues/dispatchQueue');
+          await cancelUnchainTimeout(activatedChainedOrder._id.toString(), order.driverId.toString());
+        } catch (err: any) {
+          console.warn('[OrderService] Cancel unchain timeout warn:', err.message);
+        }
+
+        try {
+          const { getSocketService } = await import('../socketInstance');
+          getSocketService().io.to(activatedChainedOrder.customerId.toString()).emit('order_status_update', {
+            orderId: activatedChainedOrder._id,
+            status: OrderStatus.ACCEPTED,
+            driverId: order.driverId,
+          });
+          getSocketService().io.to(order.driverId.toString()).emit('chained_order_activated', {
+            orderId: activatedChainedOrder._id,
+          });
+        } catch (err: any) {
+          console.warn('[OrderService] Socket emit chained activation warn:', err.message);
+        }
+      }
     } catch (error) {
       await session.abortTransaction();
       throw error;

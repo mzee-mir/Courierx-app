@@ -16,11 +16,116 @@ import { Permission } from '../enums/permissions';
 import { AdminPartnerController } from '../controllers/AdminPartnerController';
 import { requireSudo } from '../middleware/sudoGuard';
 import { AdminNotificationController } from '../controllers/AdminNotificationController';
+import { authLimiter } from '../middleware/rateLimiter';
+import { z } from 'zod';
 
 const router = Router();
 
+// --- VALIDATION SCHEMAS ---
+const objectId = z.string().regex(/^[0-9a-fA-F]{24}$/);
+
+const cancelOrderSchema = {
+  params: z.object({ orderId: objectId }),
+  body: z.object({ reason: z.string().min(3).max(500) })
+};
+
+const forceUnassignSchema = {
+  params: z.object({ orderId: objectId })
+};
+
+const disputeSchema = {
+  params: z.object({ orderId: objectId }),
+  body: z.object({
+    isDisputed: z.boolean(),
+    note: z.string().max(500).optional()
+  })
+};
+
+const adminForceStateSchema = {
+  params: z.object({ shipmentId: objectId }),
+  body: z.object({
+    newState: z.string().min(1).max(50),
+    reason: z.string().max(300).optional(),
+    bypassFSM: z.boolean().optional(),
+    nextLocationId: z.string().regex(/^[0-9a-fA-F]{24}$/).optional()
+  })
+};
+
+const resolveExceptionSchema = {
+  params: z.object({ id: objectId }),
+  body: z.object({
+    action: z.enum(['PROCEED', 'CANCEL']),
+    resolutionNote: z.string().max(300).optional()
+  })
+};
+
+const createStaffSchema = {
+  body: z.object({
+    email: z.string().email(),
+    password: z.string().min(8),
+    displayName: z.string().min(1).max(100),
+    role: z.enum(['super_admin', 'ops_admin', 'finance_admin', 'support_admin'])
+  })
+};
+
+const updateStaffSchema = {
+  params: z.object({ id: objectId }),
+  body: z.object({
+    displayName: z.string().min(1).max(100).optional(),
+    email: z.string().email().optional(),
+    role: z.enum(['super_admin', 'ops_admin', 'finance_admin', 'support_admin']).optional(),
+    password: z.string().min(8).optional()
+  }).refine(data => Object.keys(data).length > 0, { message: 'At least one field required' })
+};
+
+const deleteStaffSchema = {
+  params: z.object({ id: objectId })
+};
+
+const updateSettingSchema = {
+  params: z.object({ key: z.string().min(1).max(100) }),
+  body: z.object({
+    value: z.unknown(),
+    reason: z.string().max(300).optional()
+  })
+};
+
+const terminateSessionsSchema = {
+  params: z.object({ id: objectId })
+};
+
+const approveActionSchema = {
+  params: z.object({ actionId: objectId })
+};
+
+const createPartnerSchema = {
+  body: z.object({
+    name: z.string().min(1),
+    logoUrl: z.string().url().optional(),
+    baseRatePerKg: z.number().nonnegative(),
+    estimatedTransitDays: z.number().int().positive(),
+    warehouses: z.array(z.object({
+      country: z.string().min(1),
+      city: z.string().min(1),
+      fullAddress: z.string().min(1),
+      contactNumber: z.string().min(1)
+    })).optional(),
+    isActive: z.boolean().optional(),
+    supportedRoutes: z.array(z.string()).optional()
+  })
+};
+
+const assignPartnersSchema = {
+  params: z.object({ requestId: objectId }),
+  body: z.object({
+    chinaAgentId: z.string().regex(/^[0-9a-fA-F]{24}$/).optional(),
+    freightPartnerId: z.string().regex(/^[0-9a-fA-F]{24}$/).optional(),
+    clearingAgentId: z.string().regex(/^[0-9a-fA-F]{24}$/).optional()
+  }).refine(data => data.chinaAgentId || data.freightPartnerId || data.clearingAgentId, { message: 'Must specify at least one assignment' })
+};
+
 // --- PUBLIC ---
-router.post('/login', adminLogin);
+router.post('/login', authLimiter, adminLogin);
 
 // --- GLOBAL PROTECTED (Must be an Admin of any type) ---
 router.use(authenticateHardened);
@@ -61,6 +166,7 @@ router.get('/users',
 );
 router.patch('/users/:id/status', 
     authorizeAdmin([UserRole.SUPER_ADMIN, UserRole.SUPPORT_ADMIN]), 
+    validate({ params: z.object({ id: objectId }) }),
     enforceCapability(Permission.USER_STATUS_CHANGE),
     AdminController.toggleUserStatus
 );
@@ -103,18 +209,21 @@ router.get('/orders/active',
 router.post('/orders/:orderId/unassign', 
     authorizeAdmin([UserRole.SUPER_ADMIN, 
         UserRole.OPS_ADMIN]), 
+    validate(forceUnassignSchema),
     enforceCapability(Permission.INTERVENE_ORDERS),
     AdminOpsController.forceUnassign
 );
 router.post('/orders/:orderId/cancel', 
     authorizeAdmin([UserRole.SUPER_ADMIN, 
         UserRole.OPS_ADMIN]), 
+    validate(cancelOrderSchema),
     enforceCapability(Permission.INTERVENE_ORDERS),
     AdminOpsController.adminCancelOrder
 );
 router.patch('/orders/:orderId/dispute', 
     authorizeAdmin([UserRole.SUPER_ADMIN, 
         UserRole.OPS_ADMIN, UserRole.SUPPORT_ADMIN]), 
+    validate(disputeSchema),
     enforceCapability(Permission.INTERVENE_ORDERS),
     AdminOpsController.toggleDispute
 );
@@ -128,6 +237,7 @@ router.get('/orders/history',
 router.post('/imports/:id/resolve', 
   authorizeAdmin([UserRole.SUPER_ADMIN, 
         UserRole.SUPPORT_ADMIN, UserRole.OPS_ADMIN]), 
+    validate(resolveExceptionSchema),
     enforceCapability(Permission.RESOLVE_IMPORT_EXCEPTIONS), 
   AdminPartnerController.resolveException
 );
@@ -135,6 +245,7 @@ router.post('/imports/:id/resolve',
 router.patch('/imports/:shipmentId/force-state', 
     authorizeAdmin([UserRole.SUPER_ADMIN, 
         UserRole.SUPPORT_ADMIN, UserRole.OPS_ADMIN]), 
+    validate(adminForceStateSchema),
     enforceCapability(Permission.FORCE_SHIPMENT_STATE), 
   AdminPartnerController.adminForceState
 );
@@ -149,6 +260,7 @@ router.get('/finance/pending-deposits',
 router.post('/finance/confirm-deposit/:transactionId', 
     authorizeAdmin([UserRole.SUPER_ADMIN, 
         UserRole.FINANCE_ADMIN]), 
+    validate({ params: z.object({ transactionId: objectId }) }),
     enforceCapability(Permission.CONFIRM_DEPOSITS),
     AdminFinanceController.confirmDeposit
 );
@@ -161,6 +273,7 @@ router.get('/finance/withdrawals',
 router.post('/finance/withdrawals/:transactionId/complete', 
     authorizeAdmin([UserRole.SUPER_ADMIN, 
         UserRole.FINANCE_ADMIN]), 
+    validate({ params: z.object({ transactionId: objectId }) }),
     enforceCapability(Permission.PROCESS_WITHDRAWALS),
     AdminFinanceController.completeWithdrawal
 );
@@ -188,6 +301,7 @@ router.get('/actions/pending',
 router.post('/actions/:actionId/approve', 
   authorizeAdmin([UserRole.SUPER_ADMIN]),
   enforceCapability(Permission.SYSTEM_SETTINGS), 
+  validate(approveActionSchema),
   AdminController.approvePendingAction
 );
 
@@ -199,20 +313,24 @@ AdminController.getStaffMembers);
 
 router.post('/staff', authorizeAdmin([UserRole.SUPER_ADMIN]), 
 enforceCapability(Permission.MANAGE_STAFF),
+validate(createStaffSchema),
 AdminController.createStaffAdmin);
 
 router.patch('/staff/:id', authorizeAdmin([UserRole.SUPER_ADMIN]), 
 enforceCapability(Permission.MANAGE_STAFF),
+validate(updateStaffSchema),
 AdminController.updateStaffAdmin);
 
 router.delete('/staff/:id', authorizeAdmin([UserRole.SUPER_ADMIN]), 
 enforceCapability(Permission.MANAGE_STAFF),
 requireSudo,
+validate(deleteStaffSchema),
 AdminController.deleteStaff);
 
 router.post('/users/:id/terminate-sessions', authenticateHardened, 
     hydrateIdentity, enforceCapability(Permission.MANAGE_STAFF), 
     requireSudo, 
+    validate(terminateSessionsSchema),
     AdminController.terminateUserSessions);
 router.get('/staff/:id', 
     authenticateHardened, 
@@ -228,9 +346,9 @@ router.get('/partners',
         res.json({ success: true, partners });
     }
 );
-router.post('/partners', authorizeAdmin([UserRole.SUPER_ADMIN]), enforceCapability(Permission.ONBOARD_PARTNERS), AdminImportController.createPartner);
+router.post('/partners', authorizeAdmin([UserRole.SUPER_ADMIN]), enforceCapability(Permission.ONBOARD_PARTNERS), validate(createPartnerSchema), AdminImportController.createPartner);
 router.get('/imports/unassigned', authorizeAdmin([UserRole.SUPER_ADMIN, UserRole.OPS_ADMIN]), enforceCapability(Permission.INTERVENE_IMPORTS), AdminImportController.getUnassignedImports);
-router.patch('/imports/:requestId/assign', authorizeAdmin([UserRole.SUPER_ADMIN, UserRole.OPS_ADMIN]), enforceCapability(Permission.INTERVENE_IMPORTS), AdminImportController.assignPartners);
+router.patch('/imports/:requestId/assign', authorizeAdmin([UserRole.SUPER_ADMIN, UserRole.OPS_ADMIN]), enforceCapability(Permission.INTERVENE_IMPORTS), validate(assignPartnersSchema), AdminImportController.assignPartners);
 router.get('/imports/:id/timeline', authorizeAdmin([UserRole.SUPER_ADMIN, UserRole.OPS_ADMIN]), async (req, res) => {
     const logs = await ShipmentLog.find({ importRequestId: req.params.id }).sort({ createdAt: 1 });
     res.json({ success: true, logs });
@@ -249,19 +367,34 @@ router.get('/settings',
 router.patch('/settings/:key', 
   authorizeAdmin([UserRole.SUPER_ADMIN]),
   enforceCapability(Permission.SYSTEM_SETTINGS), 
+  validate(updateSettingSchema),
   AdminController.updateSystemSetting
 );
 
+
+const createDraftSchema = {
+  body: z.object({
+    targetRole: z.enum(['customer', 'driver', 'partner', 'all']),
+    title: z.string().min(1).max(120),
+    body: z.string().min(1).max(5000)
+  })
+};
+
+const executeDraftSchema = {
+  params: z.object({ id: objectId })
+};
 
 // STAGED BROADCASTS
 router.post('/broadcast/draft', 
   enforceCapability(Permission.SYSTEM_SETTINGS), 
   authorizeAdmin([UserRole.SUPER_ADMIN]),
+  validate(createDraftSchema),
   AdminNotificationController.createDraft
 );
 router.post('/broadcast/:id/execute', 
   enforceCapability(Permission.SYSTEM_SETTINGS), 
   authorizeAdmin([UserRole.SUPER_ADMIN]),
+  validate(executeDraftSchema),
   AdminNotificationController.execute
 );
 

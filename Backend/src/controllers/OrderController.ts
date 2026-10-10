@@ -7,8 +7,7 @@ import { DispatchService } from '../services/DispatchService';
 import mongoose from 'mongoose';
 import { Queue } from 'bullmq';
 import { DeletedOrder } from '../models/DeletedOrder';
-import { SocketService } from '../socket';
-import { socketService } from '..';
+import { getSocketService } from '../socketInstance';
 import { DriverProfile } from '../models/DriverProfile';
 import { redisClient } from '../config/redis';
 import { redactOrder } from '../utils/redact';
@@ -17,6 +16,8 @@ import { AdminAuditLog } from '../models/AdminAuditLog';
 import { WalletService } from '../services/WalletService';
 import { InternalAccount } from '../config/accounts';
 import { ORDER_FSM } from '../config/stateMachine';
+import { LandmarkService } from '../services/LandmarkService';
+import { OrderOffer } from '../models/OrderOffer';
 
 // Create the queue instance
 const manifestQueue = new Queue('manifest-processing', {
@@ -33,10 +34,11 @@ export class OrderController {
     const {
       pickupLocation,
       pickupLandmark,
+      pickupLandmarkId,
       dropoffLocation,
       dropoffLandmark,
-      vehicleType,
-      distanceKm
+      dropoffLandmarkId,
+      vehicleType
     } = req.body;
 
     const customerId = req.user?.userId;
@@ -48,14 +50,40 @@ export class OrderController {
     const existingReq = await Idempotency.findOne({ key: lookupKey });
     if (existingReq) return res.status(200).json(existingReq.responseBody);
 
+    // Resolve landmarks if not explicitly provided
+    let resolvedPickupLandmarkId = pickupLandmarkId;
+    if (!resolvedPickupLandmarkId && pickupLandmark && pickupLocation?.coordinates) {
+      try {
+        const landmark = await LandmarkService.resolveLandmark(pickupLandmark, pickupLocation.coordinates);
+        if (landmark) resolvedPickupLandmarkId = landmark._id;
+      } catch (err: any) {
+        console.warn('LANDMARK_RESOLVE_PICKUP_WARN:', err.message);
+      }
+    }
+
+    let resolvedDropoffLandmarkId = dropoffLandmarkId;
+    if (!resolvedDropoffLandmarkId && dropoffLandmark && dropoffLocation?.coordinates) {
+      try {
+        const landmark = await LandmarkService.resolveLandmark(dropoffLandmark, dropoffLocation.coordinates);
+        if (landmark) resolvedDropoffLandmarkId = landmark._id;
+      } catch (err: any) {
+        console.warn('LANDMARK_RESOLVE_DROPOFF_WARN:', err.message);
+      }
+    }
+
     const session = await mongoose.startSession();
 
     try {
-      let createdOrder;
+      let createdOrder: any;
 
       await session.withTransaction(async () => {
         // 2. PRICING & LOGIC (Server-Side Authority)
-        const { price, commission } = OrderService.calculatePricing(vehicleType, distanceKm);
+        // distanceKm is computed server-side from coordinates; client input is ignored.
+        const { price, commission, distanceKm } = OrderService.calculatePricingForOrder(
+          vehicleType,
+          pickupLocation.coordinates,
+          dropoffLocation.coordinates
+        );
         const verificationPin = OrderService.generatePin();
 
         // 3. FINANCIAL INTEGRITY: Move funds to SYSTEM:ESCROW
@@ -76,8 +104,10 @@ export class OrderController {
           customerId,
           pickupLocation,
           pickupLandmark,
+          pickupLandmarkId: resolvedPickupLandmarkId,
           dropoffLocation,
           dropoffLandmark,
+          dropoffLandmarkId: resolvedDropoffLandmarkId,
           vehicleType,
           price,
           commission,
@@ -101,6 +131,7 @@ export class OrderController {
         const responsePayload = {
           success: true,
           order: redactOrder(order),
+          distanceKm,
           traceId: requestId
         };
 
@@ -114,14 +145,9 @@ export class OrderController {
       });
 
       // 7. EXTERNAL EFFECTS: Triggered only AFTER successful DB commit
-      // Look for nearby drivers and broadcast via Socket.io
+      // Kick off multi-round deterministic batch dispatch lifecycle
       if (createdOrder) {
-        const nearbyDrivers = await DispatchService.findNearbyDrivers(
-          (createdOrder as any).pickupLocation.coordinates,
-          (createdOrder as any).vehicleType
-        );
-
-        socketService.broadcastNewOrder(nearbyDrivers, redactOrder(createdOrder));
+        await DispatchService.startDispatch(createdOrder._id.toString());
       }
 
     } catch (error: any) {
@@ -206,22 +232,63 @@ export class OrderController {
     const session = await mongoose.startSession();
     try {
       let updatedOrder;
+      let siblingDriverIdsToCancel: string[] = [];
 
       await session.withTransaction(async () => {
+        const isLegacy = process.env.DISPATCH_MODE === 'LEGACY_BROADCAST';
+        let winningOffer: any = null;
+
+        if (!isLegacy) {
+          // 1. OFFER VERIFICATION GATE
+          winningOffer = await OrderOffer.findOne({
+            orderId: id,
+            driverId: new mongoose.Types.ObjectId(driverId),
+            status: { $in: ['SENT', 'DELIVERED', 'SEEN'] },
+            expiresAt: { $gt: new Date() }
+          }).session(session);
+
+          if (!winningOffer) {
+            throw new Error('OFFER_INVALID_OR_EXPIRED: You do not have an active offer for this job.');
+          }
+        }
+
+        // Check if driver currently has an active delivery (max driver capacity invariant)
+        const activeOrder = await Order.findOne({
+          driverId: new mongoose.Types.ObjectId(driverId),
+          status: {
+            $in: [
+              OrderStatus.ACCEPTED,
+              OrderStatus.ARRIVED_AT_PICKUP,
+              OrderStatus.PICKED_UP,
+              OrderStatus.ARRIVED_AT_DROPOFF,
+            ],
+          },
+        }).session(session);
+
+        const isChainedOrder = Boolean(activeOrder);
+        const nextTargetStatus = isChainedOrder ? OrderStatus.CHAINED_RESERVED : OrderStatus.ACCEPTED;
+
         // 2. ATOMIC FIND & UPDATE WITH LOCK
-        // Query condition ensures order is still PENDING and version matches UI
+        const acceptQuery: any = {
+          _id: id,
+          status: OrderStatus.PENDING,
+        };
+        if (version !== undefined) acceptQuery.__v = version;
+
+        const updateFields: any = {
+          status: nextTargetStatus,
+          driverId: new mongoose.Types.ObjectId(driverId),
+          dispatchStatus: 'MATCHED',
+        };
+
+        if (isChainedOrder) {
+          updateFields.isChained = true;
+          updateFields.chainedAssignedAt = new Date();
+        }
+
         const order = await Order.findOneAndUpdate(
-          {
-            _id: id,
-            status: OrderStatus.PENDING,
-            __v: version
-          },
-          {
-            $set: {
-              status: OrderStatus.ACCEPTED,
-              driverId: new mongoose.Types.ObjectId(driverId)
-            }
-          },
+          acceptQuery,
+          { $set: updateFields },
           { session, new: true }
         );
 
@@ -230,6 +297,34 @@ export class OrderController {
         }
 
         updatedOrder = order;
+
+        if (winningOffer) {
+          winningOffer.status = 'ACCEPTED';
+          winningOffer.respondedAt = new Date();
+          await winningOffer.save({ session });
+
+          // Cancel sibling offers in the batch
+          const siblingOffers = await OrderOffer.find({
+            orderId: id,
+            _id: { $ne: winningOffer._id },
+            status: { $in: ['SENT', 'DELIVERED', 'SEEN'] }
+          }).session(session);
+
+          if (siblingOffers.length > 0) {
+            await OrderOffer.updateMany(
+              { orderId: id, _id: { $ne: winningOffer._id }, status: { $in: ['SENT', 'DELIVERED', 'SEEN'] } },
+              { $set: { status: 'CANCELLED' } },
+              { session }
+            );
+            siblingDriverIdsToCancel = siblingOffers.map(o => o.driverId.toString());
+          }
+
+          await DriverProfile.updateOne(
+            { userId: new mongoose.Types.ObjectId(driverId) },
+            { $inc: { totalOffersAccepted: 1 } },
+            { session }
+          );
+        }
 
         // 3. AUDIT LOG
         await AdminAuditLog.create([{
@@ -257,17 +352,53 @@ export class OrderController {
         res.status(200).json(responsePayload);
       });
 
-      // 5. POST-COMMIT NOTIFICATION
+      // 5. POST-COMMIT NOTIFICATIONS & UNCHAIN SCHEDULING
       if (updatedOrder) {
-        socketService.io.to((updatedOrder as any).customerId.toString()).emit('order_status_update', {
-          orderId: id,
-          status: OrderStatus.ACCEPTED,
-          driverId
-        });
+        const finalizedOrder = updatedOrder as any;
+        if (siblingDriverIdsToCancel.length > 0) {
+          try {
+            getSocketService().emitOfferCancelled(siblingDriverIdsToCancel, { orderId: id });
+          } catch (err: any) {
+            console.warn('[OrderController] Socket emit cancel warn:', err.message);
+          }
+        }
+
+        if (finalizedOrder.status === OrderStatus.CHAINED_RESERVED) {
+          // Schedule 5-minute unchaining timeout
+          try {
+            const { scheduleUnchainTimeout } = await import('../queues/dispatchQueue');
+            await scheduleUnchainTimeout(id, driverId!);
+          } catch (err: any) {
+            console.warn('[OrderController] Failed to schedule unchain timeout:', err.message);
+          }
+
+          try {
+            getSocketService().io.to(driverId!).emit('chained_order_reserved', {
+              orderId: id,
+              status: OrderStatus.CHAINED_RESERVED,
+            });
+            getSocketService().io.to(finalizedOrder.customerId.toString()).emit('order_status_update', {
+              orderId: id,
+              status: OrderStatus.CHAINED_RESERVED,
+              driverId,
+            });
+          } catch (err: any) {
+            console.warn('[OrderController] Socket emit chained reserved warn:', err.message);
+          }
+        } else {
+          getSocketService().io.to(finalizedOrder.customerId.toString()).emit('order_status_update', {
+            orderId: id,
+            status: OrderStatus.ACCEPTED,
+            driverId,
+          });
+        }
       }
     } catch (error: any) {
-      res.status(error.message.includes('CONCURRENCY') ? 409 : 400).json({
-        error: 'ACCEPT_FAILED',
+      const isConflict =
+        error.message.includes('CONCURRENCY') ||
+        error.message.includes('OFFER_INVALID_OR_EXPIRED');
+      res.status(isConflict ? 409 : 400).json({
+        error: isConflict ? 'OFFER_INVALID_OR_EXPIRED' : 'ACCEPT_FAILED',
         message: error.message,
         requestId
       });
@@ -307,35 +438,15 @@ export class OrderController {
         }
 
         // 3. VERSION CHECK
-        if (order.__v !== version) throw new Error('CONCURRENCY_CONFLICT: Stale data');
+        // Enforced only when the client supplies a version (the current driver
+        // app sends `{ nextStatus }` without one); absent version = no staleness
+        // guarantee, which preserves the working driver flow.
+        if (version !== undefined && order.__v !== version) throw new Error('CONCURRENCY_CONFLICT: Stale data');
 
-        // 4. SPECIAL LOGIC: FINAL SETTLEMENT
+        // 4. SETTLEMENT GUARD: DELIVERED is NOT reachable through status updates.
+        // Money movement happens ONLY through POST /orders/:id/verify (PIN-gated).
         if (nextStatus === OrderStatus.DELIVERED) {
-          // Move funds from ESCROW to DRIVER and SYSTEM
-          // This uses the WalletService we hardened in Module A
-          await WalletService.transferFunds({
-            from: InternalAccount.SYSTEM_ESCROW,
-            to: order.driverId!.toString(),
-            amount: order.price - order.commission,
-            referenceId: order._id,
-            idempotencyKey: `PAYOUT:${order._id}`,
-            description: `Driver earnings for Order ${order._id}`,
-            requestId,
-            session
-          });
-
-          await WalletService.transferFunds({
-            from: InternalAccount.SYSTEM_ESCROW,
-            to: InternalAccount.SYSTEM_REVENUE,
-            amount: order.commission,
-            referenceId: order._id,
-            idempotencyKey: `COMMISSION:${order._id}`,
-            description: `System commission for Order ${order._id}`,
-            requestId,
-            session
-          });
-
-          order.paymentSettled = true;
+          throw new Error('USE_VERIFY_ENDPOINT: Delivery completion requires PIN verification');
         }
 
         // 5. COMMIT STATE CHANGE
@@ -357,7 +468,7 @@ export class OrderController {
       if (updatedOrder) {
         const recipients = [(updatedOrder as any).customerId.toString(), (updatedOrder as any).driverId.toString()];
         recipients.forEach(r => {
-          socketService.io.to(r).emit('order_status_update', { orderId: id, status: nextStatus });
+          getSocketService().io.to(r).emit('order_status_update', { orderId: id, status: nextStatus });
         });
       }
     } catch (error: any) {
@@ -450,6 +561,34 @@ export class OrderController {
   }
 
   /**
+   * Owner-only PIN retrieval.
+   * The delivery PIN must never reach the driver; it is exposed only to the
+   * order's customer so they can relay it to the recipient at dropoff.
+   */
+  public static async getOrderPin(req: Request, res: Response): Promise<Response> {
+    try {
+      const { id } = req.params;
+      const customerId = req.user?.userId;
+
+      if (!customerId) return res.status(401).json({ error: 'UNAUTHORIZED' });
+
+      const order = await Order.findOne({
+        _id: id,
+        customerId,
+      }).select('+verificationPin');
+
+      if (!order) return res.status(404).json({ error: 'ORDER_NOT_FOUND' });
+
+      return res.status(200).json({
+        success: true,
+        verificationPin: order.verificationPin,
+      });
+    } catch (error: any) {
+      return res.status(500).json({ error: 'FETCH_PIN_FAILED' });
+    }
+  }
+
+  /**
    * Finalizes delivery and triggers wallet settlement.
    * Requires 4-digit PIN provided by the recipient.
    */
@@ -457,17 +596,39 @@ export class OrderController {
     try {
       const { id } = req.params;
       const { verificationPin } = req.body;
+      const driverId = req.user?.userId as string;
+      const idempotencyKey = req.idempotencyKey;
+
+      if (!driverId) return res.status(401).json({ error: 'UNAUTHORIZED' });
+
+      // M3: Idempotency lookup — replay returns the stored response.
+      // The settlement itself is already ledger-keyed (PAYOUT/COMMISSION) and
+      // paymentSettled-guarded; this prevents a retried request from surfacing
+      // an error for an already-settled order.
+      const lookupKey = `driver:${driverId}:verify:${id}:${idempotencyKey}`;
+      const existingReq = await Idempotency.findOne({ key: lookupKey });
+      if (existingReq) return res.status(200).json(existingReq.responseBody);
 
       // Settlement and PIN verification happen atomically in the service
-      await OrderService.verifyAndSettle(id, verificationPin);
+      await OrderService.verifyAndSettle(id, verificationPin, driverId);
 
-      return res.status(200).json({
+      const responsePayload = {
         success: true,
         message: 'DELIVERY_COMPLETED_AND_PAYMENT_SETTLED'
-      });
+      };
+      // Written after commit (the service owns its own session); a replay of the
+      // same key returns the stored success instead of ALREADY_SETTLED.
+      await Idempotency.create([{
+        key: lookupKey,
+        responseBody: responsePayload,
+        expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000)
+      }]);
+
+      return res.status(200).json(responsePayload);
     } catch (error: any) {
       // Root cause: Invalid PIN, Insufficient Funds, or Invalid State
-      return res.status(400).json({ error: error.message || 'VERIFICATION_FAILED' });
+      const status = error.message === 'NOT_ASSIGNED_DRIVER' ? 403 : 400;
+      return res.status(status).json({ error: error.message || 'VERIFICATION_FAILED' });
     }
   }
 
@@ -516,6 +677,12 @@ export class OrderController {
   public static async deleteOrder(req: Request, res: Response): Promise<Response> {
     const { id } = req.params;
     const userId = req.user?.userId;
+    const idempotencyKey = req.idempotencyKey;
+
+    // M3: Idempotency lookup — replay returns the stored response.
+    const lookupKey = `user:${userId}:delete_order:${id}:${idempotencyKey}`;
+    const existingReq = await Idempotency.findOne({ key: lookupKey });
+    if (existingReq) return res.status(200).json(existingReq.responseBody);
 
     // 1. Initialize MongoDB Session for Atomic Transaction
     const session = await mongoose.startSession();
@@ -535,7 +702,15 @@ export class OrderController {
         return res.status(403).json({ error: 'CANNOT_DELETE_ACTIVE_ORDER' });
       }
 
-      // 3. ARCHIVE: Create the Audit Record
+      // 3. REFUND ESCROW: Move any escrowed funds back to the customer atomically.
+      await WalletService.releaseEscrow({
+        order,
+        reason: 'Customer deleted pending order',
+        requestId: req.id,
+        session
+      });
+
+      // 4. ARCHIVE: Create the Audit Record
       await DeletedOrder.create([{
         originalOrderId: order._id,
         customerId: order.customerId,
@@ -547,17 +722,25 @@ export class OrderController {
         }
       }], { session });
 
-      // 4. PURGE: Remove from active collection
+      // 5. PURGE: Remove from active collection
       await Order.findByIdAndDelete(id).session(session);
 
-      // 5. COMMIT: Finalize both operations
+      // 6. COMMIT: Finalize both operations
       await session.commitTransaction();
       console.log(`AUDIT_LOG: Order ${id} archived and removed by User ${userId}`);
 
-      return res.status(200).json({
+      // 7. M3: Record the idempotency result in the same session as the deletion.
+      const responsePayload = {
         success: true,
         message: 'ORDER_ARCHIVED_SUCCESSFULLY'
-      });
+      };
+      await Idempotency.create([{
+        key: lookupKey,
+        responseBody: responsePayload,
+        expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000)
+      }], { session });
+
+      return res.status(200).json(responsePayload);
 
     } catch (error: any) {
       await session.abortTransaction();
@@ -565,6 +748,114 @@ export class OrderController {
       return res.status(500).json({ error: 'DELETE_OPERATION_FAILED' });
     } finally {
       session.endSession();
+    }
+  }
+
+  /**
+   * Driver declines a targeted offer.
+   */
+  public static async rejectOffer(req: Request, res: Response): Promise<Response> {
+    const { id } = req.params; // orderId
+    const driverId = req.user?.userId;
+    const { reason } = req.body;
+
+    try {
+      const offer = await OrderOffer.findOne({
+        orderId: id,
+        driverId: new mongoose.Types.ObjectId(driverId),
+        status: { $in: ['SENT', 'DELIVERED', 'SEEN'] },
+      });
+
+      if (!offer) {
+        return res.status(404).json({ error: 'OFFER_NOT_FOUND', message: 'No active offer found to reject.' });
+      }
+
+      offer.status = 'REJECTED';
+      offer.respondedAt = new Date();
+      offer.rejectionReason = reason || 'DECLINED_BY_DRIVER';
+      await offer.save();
+
+      await DriverProfile.updateOne(
+        { userId: new mongoose.Types.ObjectId(driverId) },
+        { $inc: { totalOffersRejected: 1 } }
+      );
+
+      return res.status(200).json({ success: true, message: 'OFFER_REJECTED' });
+    } catch (error: any) {
+      console.error('REJECT_OFFER_ERROR:', error);
+      return res.status(500).json({ error: 'REJECT_FAILED', message: error.message });
+    }
+  }
+
+  /**
+   * Driver app reports that the offer was rendered/seen on screen.
+   */
+  public static async seenOffer(req: Request, res: Response): Promise<Response> {
+    const { id } = req.params; // orderId
+    const driverId = req.user?.userId;
+
+    try {
+      const offer = await OrderOffer.findOne({
+        orderId: id,
+        driverId: new mongoose.Types.ObjectId(driverId),
+        status: { $in: ['SENT', 'DELIVERED'] },
+      });
+
+      if (offer) {
+        offer.status = 'SEEN';
+        await offer.save();
+      }
+
+      return res.status(200).json({ success: true });
+    } catch (error: any) {
+      console.error('SEEN_OFFER_ERROR:', error);
+      return res.status(500).json({ error: 'SEEN_FAILED', message: error.message });
+    }
+  }
+
+  /**
+   * Phase 4: Submit 1-tap post-delivery verification feedback for the dropoff landmark.
+   * Body: { isAccurate: boolean }
+   * Updates landmark confidence score (+5 or -10).
+   */
+  public static async submitLandmarkFeedback(req: Request, res: Response): Promise<Response> {
+    const { id } = req.params; // orderId
+    const driverId = req.user?.userId;
+    const { isAccurate } = req.body;
+
+    if (typeof isAccurate !== 'boolean') {
+      return res.status(400).json({ error: 'INVALID_FEEDBACK', message: 'isAccurate must be a boolean' });
+    }
+
+    try {
+      const order = await Order.findById(id);
+      if (!order) {
+        return res.status(404).json({ error: 'ORDER_NOT_FOUND' });
+      }
+
+      // Must be the assigned driver
+      if (!order.driverId || order.driverId.toString() !== driverId) {
+        return res.status(403).json({ error: 'NOT_ASSIGNED_DRIVER' });
+      }
+
+      const landmarkId = order.dropoffLandmarkId || order.pickupLandmarkId;
+      if (!landmarkId) {
+        return res.status(400).json({
+          error: 'NO_ASSOCIATED_LANDMARK',
+          message: 'This order does not have an associated landmark to review',
+        });
+      }
+
+      const updatedLandmark = await LandmarkService.recordFeedback(landmarkId, isAccurate);
+
+      return res.status(200).json({
+        success: true,
+        landmarkId,
+        confidenceScore: updatedLandmark?.confidenceScore ?? 50,
+      });
+    } catch (error: any) {
+      console.error('LANDMARK_FEEDBACK_ERROR:', error);
+      return res.status(500).json({ error: 'FEEDBACK_FAILED', message: error.message });
     }
   }
 }

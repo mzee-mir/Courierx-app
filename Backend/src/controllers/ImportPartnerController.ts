@@ -1,6 +1,6 @@
 import { Request, Response } from 'express';
 import { ImportRequest, ImportStatus } from '../models/ImportRequest';
-import { IMPORT_FSM, ManifestStatus, validateImportTransition } from '../config/stateMachine';
+import { IMPORT_FSM, MANIFEST_FSM, ManifestStatus, validateImportTransition } from '../config/stateMachine';
 import { ShipmentLog } from '../models/ShipmentLog';
 import mongoose, { Types } from 'mongoose';
 import { ResolverService } from '../services/ResolverService';
@@ -14,9 +14,9 @@ import { SystemSettings } from '../models/SystemSettings';
 import { log } from 'console';
 import { PartnerRateCard } from '../models/PartnerRateCard';
 import { PartnerLocation } from '../models/PartnerLocation';
-import { socketService } from '..';
 import { redactOrder } from '../utils/redact';
 import { NotificationService } from '../services/notificationService';
+import { readIdempotency, writeIdempotency } from '../utils/idempotency';
 
 /**
  * HELPER: The System Authority Map
@@ -63,8 +63,14 @@ export class ImportPartnerController {
     } = req.body;
 
     const partnerId = req.user?.partnerId;
+    const idempotencyKey = req.idempotencyKey;
 
     try {
+      // M3: Idempotency lookup — replay returns the stored response.
+      const lookupKey = `partner:${partnerId}:scan_intake:${trackingNumber}:${idempotencyKey}`;
+      const existingReq = await readIdempotency(lookupKey);
+      if (existingReq) return res.status(200).json(existingReq.responseBody);
+
       // 2. Lookup using Case-Insensitive Regex (Logistics Standard)
       const shipment = await ImportRequest.findOne({
         externalTrackingNumber: { $regex: `^${trackingNumber}$`, $options: 'i' }
@@ -126,15 +132,18 @@ export class ImportPartnerController {
       // 5. Final Save
       await shipment.save();
 
-      // 6. Response
-      res.status(200).json({
+      const responsePayload = {
         success: true,
         message: 'INTAKE_COMPLETE',
         cxCode: randomPackageId,
         customerPhone: (shipment.userId as any)?.phoneNumber || "N/A",
         price: pricing.totalCustomerPaid,
         calculatedCBM: pricing.calculatedCBM || 0
-      });
+      };
+      await writeIdempotency(lookupKey, responsePayload);
+
+      // 6. Response
+      res.status(200).json(responsePayload);
 
       // Task 5.1: Notify customer (non-blocking, post-response)
       NotificationService.sendImportStatusNotification({
@@ -317,9 +326,15 @@ export class ImportPartnerController {
     const { id } = req.params;
     const { resolutionAction, notes } = req.body; // Action: 'RELEASE' | 'CANCEL' | 'RETURN'
     const user = req.user!;
+    const idempotencyKey = req.idempotencyKey;
 
     const session = await mongoose.startSession();
     try {
+      // M3: Idempotency lookup — replay returns the stored response.
+      const lookupKey = `partner:${user.userId}:resolve_exception:${id}:${resolutionAction}:${idempotencyKey}`;
+      const existingReq = await readIdempotency(lookupKey);
+      if (existingReq) return res.status(200).json(existingReq.responseBody);
+
       await session.withTransaction(async () => {
         const shipment = await ImportRequest.findById(id).session(session);
         if (!shipment) throw new Error('SHIPMENT_NOT_FOUND');
@@ -332,6 +347,12 @@ export class ImportPartnerController {
 
         const oldStatus = shipment.status;
 
+        // M2 NOTE — DOCUMENTED FSM EXCEPTION (audited escalation):
+        // A flagged shipment is by definition frozen (validateImportTransition would
+        // throw on isFlagged), so exception resolution MUST bypass the FSM validator.
+        // RELEASE → READY_FOR_LOCAL_HANDOFF and CANCEL → EXCEPTION are the two
+        // intentional terminal/resume actions; both are fully audited below via
+        // CustodyLog + ShipmentLog.
         if (resolutionAction === 'RELEASE') {
           shipment.isFlagged = false;
           // Move to the next logical step since it was likely stuck at Arrival
@@ -387,6 +408,9 @@ export class ImportPartnerController {
           notes: `EXCEPTION_RESOLVED [${resolutionAction}]: ${notes}`,
           location: 'MANAGEMENT_OFFICE'
         }], { session });
+
+        const responsePayload = { success: true };
+        await writeIdempotency(lookupKey, responsePayload, session);
       });
 
       res.json({ success: true });
@@ -624,6 +648,11 @@ export class ImportPartnerController {
     const user = req.user!;
     const shipment = (req as any).shipment; // Injected by enforceCustody middleware
 
+    // M3: Idempotency lookup — replay returns the stored response.
+    const lookupKey = `partner:${user.userId}:transition:${id}:${actionCode || 'none'}:${req.idempotencyKey}`;
+    const existingReq = await readIdempotency(lookupKey);
+    if (existingReq) return res.status(200).json(existingReq.responseBody);
+
     const session = await mongoose.startSession();
 
     try {
@@ -640,6 +669,8 @@ export class ImportPartnerController {
 
         // 2. FSM GATEKEEPER: Check for Exception Locks and Logical Jumps
         // This closes the "FSM Bypass" vulnerability identified in the audit.
+        // M2: validated BEFORE the status write at the bottom of this transaction,
+        // so no direct status mutation can skip the state machine.
         validateImportTransition(shipment, nextStatus, user);
 
         const oldStatus = shipment.status;
@@ -688,6 +719,13 @@ export class ImportPartnerController {
           location: shipment.currentLocationId.toString(),
           notes: notes || `Action [${actionCode}] verified at ${shipment.currentLocationId}`
         }], { session });
+
+        const responseBody = {
+          success: true,
+          status: shipment.status,
+          currentLocation: shipment.currentLocationId
+        };
+        await writeIdempotency(lookupKey, responseBody, session);
       });
 
       res.status(200).json({
@@ -720,6 +758,13 @@ export class ImportPartnerController {
   public static async resolveAndIntake(req: Request, res: Response) {
     const { cxCode, externalTrackingNumber, itemDescription, originCountry, shippingMode, isFragile, locationId, intakeWeight } = req.body;
     const partnerId = req.user?.partnerId;
+    const userId = req.user?.userId;
+
+    // M3: Idempotency lookup — replay returns the stored response.
+    const lookupKey = `partner:${userId}:resolve_intake:${externalTrackingNumber}:${req.idempotencyKey}`;
+    const existingReq = await readIdempotency(lookupKey);
+    if (existingReq) return res.status(201).json(existingReq.responseBody);
+
     const session = await mongoose.startSession();
 
     try {
@@ -768,11 +813,13 @@ export class ImportPartnerController {
           notes: `Shipment resolved for ${cxCode} and intake weight recorded.`
         }], { session });
 
-        res.status(201).json({
+        const responseBody = {
           success: true,
           shipmentId: shipment[0]._id,
           resolvedFor: resolution.snapshot.name
-        });
+        };
+        await writeIdempotency(lookupKey, responseBody, session);
+        res.status(201).json(responseBody);
       });
     } catch (error: any) {
       res.status(400).json({ error: error.message });
@@ -841,6 +888,11 @@ export class ImportPartnerController {
     }
 
     shipment.isFlagged = false;
+    // M2 NOTE — DOCUMENTED FSM EXCEPTION: terminal exception resolution. CANCELLED
+    // is only FSM-reachable from DECLARED/RECEIVED_AT_ORIGIN; this is a manager
+    // escalation for frozen shipments (the shipment was flagged, i.e. the FSM
+    // validator would reject any standard move). Audited by the caller's
+    // enforceCapability + this resolve path.
     if (action === 'CANCEL') shipment.status = 'CANCELLED' as any;
     await shipment.save();
 
@@ -854,6 +906,12 @@ export class ImportPartnerController {
     const { id: manifestId } = req.params;
     const { trackingNumber, arrivalWeight, notes, photos } = req.body;
     const user = req.user!;
+
+    // M3: Idempotency lookup — replay returns the stored response.
+    const lookupKey = `partner:${user.userId}:verify_unseal:${manifestId}:${trackingNumber}:${req.idempotencyKey}`;
+    const existingReq = await readIdempotency(lookupKey);
+    if (existingReq) return res.status(200).json(existingReq.responseBody);
+
     const session = await mongoose.startSession();
 
     try {
@@ -882,6 +940,14 @@ export class ImportPartnerController {
         const oldStatus = shipment.status;
         let newStatus = ImportStatus.READY_FOR_LOCAL_HANDOFF;
 
+        // M2 — FSM GUARD: verification happens at the destination hub, so the
+        // shipment must already be ARRIVED_LOCAL (reached via transitionManifest
+        // ARRIVE, which propagates IN_TRANSIT → ARRIVED_LOCAL). Jumping straight
+        // from IN_TRANSIT to READY_FOR_LOCAL_HANDOFF would skip a required node.
+        if (shipment.status !== ImportStatus.ARRIVED_LOCAL) {
+          throw new Error('FSM_VIOLATION: Shipment must be ARRIVED_LOCAL before destination verification.');
+        }
+
         if (needsOnwardTransit && isGateway) {
           const rate = partner?.domesticConfig?.ratePerKg || 1.0;
           const surcharge = Number(arrivalWeight) * rate;
@@ -889,7 +955,9 @@ export class ImportPartnerController {
           shipment.pricingSnapshot.totalCustomerPaid += surcharge;
           shipment.pricingSnapshot.partnerShare += surcharge;
           shipment.domesticSurcharge = surcharge;
-          newStatus = ImportStatus.ARRIVED_LOCAL; // Stays here for domestic manifesting
+          // Intentional self-transition: the shipment stays at ARRIVED_LOCAL to be
+          // put on a domestic manifest (only remaining legal path in IMPORT_FSM).
+          newStatus = ImportStatus.ARRIVED_LOCAL;
         }
 
         shipment.status = newStatus;
@@ -933,6 +1001,9 @@ export class ImportPartnerController {
           notes: notes || `Arrival verified at ${isGateway ? 'Gateway' : 'Branch'}.`,
           location: (manifest.destinationHub as any).name
         }], { session });
+
+        const responseBody = { success: true };
+        await writeIdempotency(lookupKey, responseBody, session);
       });
 
       res.status(200).json({ success: true });
@@ -949,9 +1020,32 @@ export class ImportPartnerController {
   public static async finalizeUnsealing(req: Request, res: Response) {
     const { id } = req.params;
     const { closingDescription } = req.body;
+    const user = req.user!;
+
+    // M3: Idempotency lookup — replay returns the stored response.
+    const lookupKey = `partner:${user.userId}:finalize_unseal:${id}:${req.idempotencyKey}`;
+    const existingReq = await readIdempotency(lookupKey);
+    if (existingReq) return res.json(existingReq.responseBody);
 
     const manifest = await Manifest.findById(id);
     if (!manifest) return res.status(404).json({ error: 'MANIFEST_NOT_FOUND' });
+
+    // M2 — FSM GATE + custody: DISMANTLED is only reachable from ARRIVED, and
+    // only by staff physically at the destination hub.
+    const allowed = MANIFEST_FSM[manifest.status as unknown as ManifestStatus];
+    if (!allowed || !allowed.includes(ManifestStatus.DISMANTLED)) {
+      return res.status(400).json({
+        error: 'FSM_VIOLATION',
+        message: `Cannot dismantle a manifest in ${manifest.status} status.`
+      });
+    }
+    const userLocations = user.assignedLocations.map(l => l.toString());
+    if (!userLocations.includes(manifest.destinationHub?.toString())) {
+      return res.status(403).json({
+        error: 'AUTHORITY_VIOLATION',
+        message: 'Only Destination Hub staff can dismantle this manifest.'
+      });
+    }
 
     manifest.status = ManifestStatus.DISMANTLED;
     await manifest.save();
@@ -965,7 +1059,9 @@ export class ImportPartnerController {
       requestId: req.id
     });
 
-    res.json({ success: true });
+    const responsePayload = { success: true };
+    await writeIdempotency(lookupKey, responsePayload);
+    res.json(responsePayload);
   }
 
   /**
@@ -975,6 +1071,12 @@ export class ImportPartnerController {
     const { id } = req.params;
     const { newWeight, reason } = req.body;
     const partnerId = req.user?.partnerId;
+    const userId = req.user?.userId;
+
+    // M3: Idempotency lookup — replay returns the stored response.
+    const lookupKey = `partner:${userId}:correct_weight:${id}:${req.idempotencyKey}`;
+    const existingReq = await readIdempotency(lookupKey);
+    if (existingReq) return res.json(existingReq.responseBody);
 
     const session = await mongoose.startSession();
     try {
@@ -1015,6 +1117,9 @@ export class ImportPartnerController {
           notes: `WEIGHT_CORRECTED: ${oldWeight}kg -> ${newWeight}kg. Reason: ${reason}`,
           location: 'OFFICE_CORRECTION'
         }], { session });
+
+        const responseBody = { success: true, message: 'Weight corrected and price recalculated.' };
+        await writeIdempotency(lookupKey, responseBody, session);
       });
 
       res.json({ success: true, message: 'Weight corrected and price recalculated.' });
@@ -1032,6 +1137,13 @@ export class ImportPartnerController {
   public static async quickIntake(req: Request, res: Response) {
     const { phoneNumber, trackingNumber, weight, itemDescription, mode, locationId, binLocation } = req.body;
     const partnerId = req.user?.partnerId;
+    const userId = req.user?.userId;
+
+    // M3: Idempotency lookup — replay returns the stored response.
+    const lookupKey = `partner:${userId}:quick_intake:${trackingNumber}:${req.idempotencyKey}`;
+    const existingReq = await readIdempotency(lookupKey);
+    if (existingReq) return res.status(201).json(existingReq.responseBody);
+
     const session = await mongoose.startSession();
 
     // 1. Define the Bakara Market Fallback Constants
@@ -1093,13 +1205,15 @@ export class ImportPartnerController {
           intakeMethod: 'SCAN'
         }], { session });
 
-        res.status(201).json({
+        const responseBody = {
           success: true,
           resolvedFor: user.displayName,
           cxCode: randomPackageId,
           customerPhone: user.phoneNumber,
           note: userDefault ? "Using customer home address" : "Fallback to Bakara Market applied"
-        });
+        };
+        await writeIdempotency(lookupKey, responseBody, session);
+        res.status(201).json(responseBody);
       });
     } catch (error: any) {
       console.error("QUICK_INTAKE_ERROR:", error.message);
@@ -1108,21 +1222,27 @@ export class ImportPartnerController {
       session.endSession();
     }
   }
-
   public static async processHandoff(req: Request, res: Response) {
     const { id } = req.params; // Shipment ID
     const actorId = req.user?.userId;
+
+    // M3: Idempotency lookup — replay returns the stored response.
+    const lookupKey = `partner:${actorId}:handoff:${id}:${req.idempotencyKey}`;
+    const existingReq = await readIdempotency(lookupKey);
+    if (existingReq) return res.status(200).json(existingReq.responseBody);
 
     try {
       // Note: 'enforceCustody' middleware should be applied to this route
       // to ensure only the Somalia Clearing Agent can trigger handoff.
       const result = await ImportService.initiateLocalHandoff(id, actorId!);
 
-      res.status(200).json({
+      const responsePayload = {
         success: true,
         message: 'HANDOFF_COMPLETE',
         localOrderId: result.localOrderId
-      });
+      };
+      await writeIdempotency(lookupKey, responsePayload);
+      res.status(200).json(responsePayload);
     } catch (error: any) {
       res.status(400).json({ error: error.message });
     }
@@ -1138,6 +1258,12 @@ export class ImportPartnerController {
   public static async updatePartnerSettings(req: Request, res: Response) {
     const { airRate, seaRate, dailyIntakeTarget, reason } = req.body;
     const partnerId = req.user?.partnerId;
+    const userId = req.user?.userId;
+
+    // M3: Idempotency lookup — replay returns the stored response.
+    const lookupKey = `partner:${userId}:update_settings:${req.idempotencyKey}`;
+    const existingReq = await readIdempotency(lookupKey);
+    if (existingReq) return res.json(existingReq.responseBody);
 
     const session = await mongoose.startSession();
     try {
@@ -1182,6 +1308,9 @@ export class ImportPartnerController {
           details: `Rates: A:${airRate}/S:${seaRate} | Target: ${dailyIntakeTarget}. Reason: ${reason}`,
           requestId: req.id
         }], { session });
+
+        const responseBody = { success: true };
+        await writeIdempotency(lookupKey, responseBody, session);
       });
 
       res.json({ success: true });
@@ -1239,7 +1368,13 @@ export class ImportPartnerController {
   public static async createLocation(req: Request, res: Response) {
     try {
       const partnerId = req.user?.partnerId;
+      const userId = req.user?.userId;
       const { name, type, country, city, address } = req.body;
+
+      // M3: Idempotency lookup — replay returns the stored response.
+      const lookupKey = `partner:${userId}:create_location:${req.idempotencyKey}`;
+      const existingReq = await readIdempotency(lookupKey);
+      if (existingReq) return res.status(201).json(existingReq.responseBody);
 
       const location = await PartnerLocation.create({
         partnerId,
@@ -1249,7 +1384,9 @@ export class ImportPartnerController {
         city,
         address
       });
-      res.status(201).json({ success: true, location });
+      const responsePayload = { success: true, location };
+      await writeIdempotency(lookupKey, responsePayload);
+      res.status(201).json(responsePayload);
     } catch (error: any) {
       res.status(400).json({ error: 'CREATE_LOCATION_FAILED', message: error.message });
     }
@@ -1258,12 +1395,20 @@ export class ImportPartnerController {
   public static async updateDomesticRate(req: Request, res: Response) {
     try {
       const partnerId = req.user?.partnerId;
+      const userId = req.user?.userId;
       const { ratePerKg } = req.body;
+
+      // M3: Idempotency lookup — replay returns the stored response.
+      const lookupKey = `partner:${userId}:update_domestic_rate:${req.idempotencyKey}`;
+      const existingReq = await readIdempotency(lookupKey);
+      if (existingReq) return res.status(200).json(existingReq.responseBody);
 
       await PartnerOrganization.findByIdAndUpdate(partnerId, {
         "domesticConfig.ratePerKg": ratePerKg
       });
-      res.status(200).json({ success: true });
+      const responsePayload = { success: true };
+      await writeIdempotency(lookupKey, responsePayload);
+      res.status(200).json(responsePayload);
     } catch (error: any) {
       res.status(400).json({ error: 'UPDATE_DOMESTIC_RATE_FAILED', message: error.message });
     }
@@ -1272,8 +1417,14 @@ export class ImportPartnerController {
   public static async updateLocation(req: Request, res: Response) {
     try {
       const partnerId = req.user?.partnerId;
+      const userId = req.user?.userId;
       const { id } = req.params;
       const updates = req.body;
+
+      // M3: Idempotency lookup — replay returns the stored response.
+      const lookupKey = `partner:${userId}:update_location:${id}:${req.idempotencyKey}`;
+      const existingReq = await readIdempotency(lookupKey);
+      if (existingReq) return res.status(200).json(existingReq.responseBody);
 
       const location = await PartnerLocation.findOneAndUpdate(
         { _id: id, partnerId },
@@ -1281,7 +1432,9 @@ export class ImportPartnerController {
         { new: true }
       );
       if (!location) return res.status(404).json({ error: 'LOCATION_NOT_FOUND' });
-      res.status(200).json({ success: true, location });
+      const responsePayload = { success: true, location };
+      await writeIdempotency(lookupKey, responsePayload);
+      res.status(200).json(responsePayload);
     } catch (error: any) {
       res.status(400).json({ error: 'UPDATE_LOCATION_FAILED', message: error.message });
     }
@@ -1292,8 +1445,13 @@ export class ImportPartnerController {
  */
   public static async updatePublicProfile(req: Request, res: Response) {
     try {
-      const { partnerId } = req.user!;
+      const { partnerId, userId } = req.user!;
       const updateData = req.body;
+
+      // M3: Idempotency lookup — replay returns the stored response.
+      const lookupKey = `partner:${userId}:update_public_profile:${req.idempotencyKey}`;
+      const existingReq = await readIdempotency(lookupKey);
+      if (existingReq) return res.json(existingReq.responseBody);
 
       const updated = await PartnerOrganization.findByIdAndUpdate(
         partnerId,
@@ -1301,7 +1459,9 @@ export class ImportPartnerController {
         { new: true }
       );
 
-      res.json({ success: true, data: updated?.publicProfile });
+      const responsePayload = { success: true, data: updated?.publicProfile };
+      await writeIdempotency(lookupKey, responsePayload);
+      res.json(responsePayload);
     } catch (error) {
       res.status(400).json({ error: 'UPDATE_PROFILE_FAILED' });
     }
@@ -1374,11 +1534,19 @@ export class ImportPartnerController {
   public static async deleteLocation(req: Request, res: Response) {
     try {
       const partnerId = req.user?.partnerId;
+      const userId = req.user?.userId;
       const { id } = req.params;
+
+      // M3: Idempotency lookup — replay returns the stored response.
+      const lookupKey = `partner:${userId}:delete_location:${id}:${req.idempotencyKey}`;
+      const existingReq = await readIdempotency(lookupKey);
+      if (existingReq) return res.status(200).json(existingReq.responseBody);
 
       const location = await PartnerLocation.findOneAndDelete({ _id: id, partnerId });
       if (!location) return res.status(404).json({ error: 'LOCATION_NOT_FOUND' });
-      res.status(200).json({ success: true });
+      const responsePayload = { success: true };
+      await writeIdempotency(lookupKey, responsePayload);
+      res.status(200).json(responsePayload);
     } catch (error: any) {
       res.status(400).json({ error: 'DELETE_LOCATION_FAILED', message: error.message });
     }

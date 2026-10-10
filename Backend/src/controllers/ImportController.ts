@@ -4,6 +4,11 @@ import { ShipmentLog } from '../models/ShipmentLog';
 import { Order } from '../models/Order';
 import { PartnerOrganization } from '../models/PartnerOrganization';
 import mongoose, { Types } from 'mongoose';
+import { OrderService } from '../services/OrderService';
+import { WalletService } from '../services/WalletService';
+import { InternalAccount } from '../config/accounts';
+import { VehicleType } from '../enums/OrderEnums';
+import { readIdempotency, writeIdempotency } from '../utils/idempotency';
 
 // Active statuses (in transit, not resolved)
 const ACTIVE_STATUSES = [
@@ -47,6 +52,14 @@ export class ImportController {
       } = req.body;
 
       const userId = req.user?.userId;
+      const idempotencyKey = req.idempotencyKey;
+
+      // M3: Idempotency lookup — replay returns the stored response.
+      // Keyed by user+tracking so a network retry cannot create a duplicate
+      // declaration (the 409 duplicate check below is the second line of defense).
+      const lookupKey = `user:${userId}:import_declare:${externalTrackingNumber}:${idempotencyKey}`;
+      const existingReq = await readIdempotency(lookupKey);
+      if (existingReq) return res.status(201).json(existingReq.responseBody);
 
       // Task 2.3: Proper duplicate detection — scoped to this user with 409
       const existing = await ImportRequest.findOne({ userId, externalTrackingNumber });
@@ -105,7 +118,9 @@ export class ImportController {
         changedAt: new Date()
       });
 
-      res.status(201).json({ success: true, request });
+      const responsePayload = { success: true, request };
+      await writeIdempotency(lookupKey, responsePayload);
+      res.status(201).json(responsePayload);
     } catch (error) {
       res.status(500).json({ error: 'DECLARATION_FAILED' });
     }
@@ -276,6 +291,12 @@ export class ImportController {
     try {
       const { id } = req.params;
       const userId = req.user?.userId;
+      const idempotencyKey = req.idempotencyKey;
+
+      // M3: Idempotency lookup — replay returns the stored response.
+      const lookupKey = `user:${userId}:upload_doc:${id}:${idempotencyKey}`;
+      const existingReq = await readIdempotency(lookupKey);
+      if (existingReq) return res.status(200).json(existingReq.responseBody);
 
       const shipment = await ImportRequest.findOne({ _id: id, userId });
       if (!shipment) return res.status(404).json({ error: 'IMPORT_NOT_FOUND' });
@@ -294,7 +315,9 @@ export class ImportController {
       }
 
       await shipment.save();
-      res.status(200).json({ success: true, documentUrl });
+      const responsePayload = { success: true, documentUrl };
+      await writeIdempotency(lookupKey, responsePayload);
+      res.status(200).json(responsePayload);
     } catch (error) {
       res.status(500).json({ error: 'DOCUMENT_UPLOAD_FAILED' });
     }
@@ -403,17 +426,47 @@ export class ImportController {
       try {
         let order: any;
         await session.withTransaction(async () => {
+          // Map the lowercase client vehicle type to the uppercase order enum.
+          const vehicleMapping: Record<string, VehicleType> = {
+            'bajaj': VehicleType.BAJAJ,
+            'car': VehicleType.CAR,
+            'truck': VehicleType.TRUCK
+          };
+          const orderVehicle = vehicleMapping[vehicleType] || VehicleType.BAJAJ;
+
+          // Server-computed local-delivery pricing (never trusts the client).
+          const dropCoords = dropoffLocation?.coordinates || [0, 0];
+          const { price, commission } = OrderService.calculatePricingForOrder(
+            orderVehicle,
+            [0, 0],
+            dropCoords
+          );
+
+          // FUND ESCROW: debit the customer wallet before the order can be delivered.
+          // Mirrors OrderController.create so payouts are always backed by escrow.
+          await WalletService.transferFunds({
+            from: userId!,
+            to: InternalAccount.SYSTEM_ESCROW,
+            amount: price,
+            referenceId: shipment._id,
+            idempotencyKey: `LOCAL_ESCROW:${shipment._id}`,
+            description: `Escrow for local delivery of import ${shipment._id}`,
+            requestId: req.id,
+            session
+          });
+
           [order] = await Order.create([{
             customerId: userId,
             pickupLocation: { type: 'Point', coordinates: [0, 0] },
             pickupLandmark: 'Partner Warehouse',
             dropoffLocation,
             dropoffLandmark,
-            vehicleType,
-            price: 5.0,
-            commission: 1.0,
-            verificationPin: '1234',
-            status: 'PENDING'
+            vehicleType: orderVehicle,
+            price,
+            commission,
+            verificationPin: OrderService.generatePin(),
+            status: 'PENDING',
+            importShipmentId: shipment._id
           }], { session });
 
           shipment.localOrderId = order._id;
@@ -448,8 +501,17 @@ export class ImportController {
       } finally {
         session.endSession();
       }
-    } catch (error) {
+    } catch (error: any) {
       console.error(error);
+      if (error.message.includes('INSUFFICIENT_FUNDS')) {
+        return res.status(402).json({
+          success: false,
+          requiresPayment: true,
+          amountDue: null,
+          currency: 'USD',
+          message: 'Insufficient wallet balance to fund the local delivery escrow.'
+        });
+      }
       res.status(500).json({ error: 'HANDOFF_FAILED' });
     }
   }
@@ -459,10 +521,16 @@ export class ImportController {
       const { id } = req.params;
       const { newStatus, notes } = req.body;
       const userId = req.user?.userId;
+      const idempotencyKey = req.idempotencyKey;
 
       if (!newStatus) {
         return res.status(400).json({ error: 'NEW_STATUS_REQUIRED' });
       }
+
+      // M3: Idempotency lookup — replay returns the stored response.
+      const lookupKey = `user:${userId}:import_status:${id}:${newStatus}:${idempotencyKey}`;
+      const existingReq = await readIdempotency(lookupKey);
+      if (existingReq) return res.status(200).json(existingReq.responseBody);
 
       // 1. Fetch with ownership check (importOwnershipGuard already ran, but we need the live doc)
       const shipment = await ImportRequest.findOne({ _id: id, userId });
@@ -518,6 +586,14 @@ export class ImportController {
             changedBy: userId,
             changedAt: new Date()
           }], { session });
+
+          const responseBody = {
+            success: true,
+            importId: id,
+            previousStatus: oldStatus,
+            currentStatus: newStatus
+          };
+          await writeIdempotency(lookupKey, responseBody, session);
         });
       } finally {
         session.endSession();
@@ -562,6 +638,12 @@ export class ImportController {
       const { id } = req.params;
       const { problemType, description, photoUrls } = req.body;
       const userId = req.user?.userId;
+      const idempotencyKey = req.idempotencyKey;
+
+      // M3: Idempotency lookup — replay returns the stored response.
+      const lookupKey = `user:${userId}:import_dispute:${id}:${idempotencyKey}`;
+      const existingReq = await readIdempotency(lookupKey);
+      if (existingReq) return res.status(201).json(existingReq.responseBody);
 
       const shipment = await ImportRequest.findOne({ _id: id, userId });
       if (!shipment) return res.status(404).json({ error: 'IMPORT_NOT_FOUND' });
@@ -580,7 +662,7 @@ export class ImportController {
       shipment.statusHistory.push({
         status: shipment.status,
         changedAt: new Date(),
-        changedBy: userId,
+        changedBy: new Types.ObjectId(userId),
         changedByRole: 'CUSTOMER',
         notes: `Customer reported problem [${problemType}]: ${description}${photoNote}`
       });
@@ -596,7 +678,9 @@ export class ImportController {
         changedAt: new Date()
       });
 
-      res.status(201).json({ success: true, message: 'Dispute report filed successfully.' });
+      const responsePayload = { success: true, message: 'Dispute report filed successfully.' };
+      await writeIdempotency(lookupKey, responsePayload);
+      res.status(201).json(responsePayload);
     } catch (error) {
       res.status(500).json({ error: 'DISPUTE_FILING_FAILED' });
     }

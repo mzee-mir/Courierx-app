@@ -3,7 +3,10 @@ import { Order } from '../models/Order';
 import { AdminAuditLog } from '../models/AdminAuditLog';
 import { OrderStatus } from '../enums/OrderEnums';
 import mongoose from 'mongoose';
-import { socketService } from '..'; // To notify drivers instantly
+import { getSocketService } from '../socketInstance'; // To notify drivers instantly
+import { WalletService } from '../services/WalletService';
+import { ORDER_FSM } from '../config/stateMachine';
+import { readIdempotency, writeIdempotency } from '../utils/idempotency';
 
 export class AdminOpsController {
 
@@ -14,8 +17,14 @@ export class AdminOpsController {
   public static async forceUnassign(req: Request, res: Response) {
     const { orderId } = req.params;
     const adminId = req.user?.userId;
+    const idempotencyKey = req.idempotencyKey;
 
     try {
+      // M3: Idempotency lookup — replay returns the stored response.
+      const lookupKey = `admin:${adminId}:force_unassign:${orderId}:${idempotencyKey}`;
+      const existingReq = await readIdempotency(lookupKey);
+      if (existingReq) return res.status(200).json(existingReq.responseBody);
+
       const order = await Order.findById(orderId);
       if (!order) return res.status(404).json({ error: 'ORDER_NOT_FOUND' });
 
@@ -26,7 +35,10 @@ export class AdminOpsController {
 
       const originalDriverId = order.driverId;
 
-      // Update Order
+      // M2 NOTE — DOCUMENTED FSM EXCEPTION (audited escalation):
+      // Resetting to PENDING is an explicit recovery tool for dead/offline drivers.
+      // PENDING is NOT reachable from ACCEPTED via ORDER_FSM, so this is a deliberate
+      // bypass, fully audited by the FORCE_UNASSIGN AdminAuditLog entry below.
       order.driverId = undefined;
       order.status = OrderStatus.PENDING;
       await order.save();
@@ -42,13 +54,15 @@ export class AdminOpsController {
 
       // Real-time: Notify the original driver they are off the job
       if (originalDriverId) {
-        socketService.io.to(originalDriverId.toString()).emit('order_revoked', { 
+        getSocketService().io.to(originalDriverId.toString()).emit('order_revoked', { 
           orderId, 
           reason: 'Admin Intervention' 
         });
       }
 
-      res.status(200).json({ success: true, message: 'ORDER_RESET_TO_PENDING' });
+      const responsePayload = { success: true, message: 'ORDER_RESET_TO_PENDING' };
+      await writeIdempotency(lookupKey, responsePayload);
+      res.status(200).json(responsePayload);
     } catch (error) {
       res.status(500).json({ error: 'UNASSIGN_FAILED' });
     }
@@ -79,15 +93,44 @@ export class AdminOpsController {
     const { orderId } = req.params;
     const { reason } = req.body;
     const adminId = req.user?.userId;
+    const idempotencyKey = req.idempotencyKey;
 
     if (!reason) return res.status(400).json({ error: 'CANCELLATION_REASON_REQUIRED' });
 
+    // M3: Idempotency lookup — replay returns the stored response.
+    const lookupKey = `admin:${adminId}:cancel_order:${orderId}:${idempotencyKey}`;
+    const existingReq = await readIdempotency(lookupKey);
+    if (existingReq) return res.status(200).json(existingReq.responseBody);
+
+    const session = await mongoose.startSession();
     try {
-      const order = await Order.findById(orderId);
+      const order = await Order.findById(orderId).session(session);
       if (!order) return res.status(404).json({ error: 'ORDER_NOT_FOUND' });
 
+      // M2 — FSM GATE: CANCELLED is only legal from PENDING/ACCEPTED in ORDER_FSM.
+      // Admin cancellation is an audited escalation (ADMIN_CANCEL log below), but
+      // it must still follow the state machine so in-flight orders (PICKED_UP etc.)
+      // cannot be silently killed; those require the PIN-gated settlement or a
+      // FORCE_UNASSIGN recovery instead.
+      const allowed = ORDER_FSM[order.status as OrderStatus];
+      if (!allowed || !allowed.includes(OrderStatus.CANCELLED)) {
+        return res.status(400).json({
+          error: 'FSM_VIOLATION',
+          message: `Cannot cancel an order in ${order.status} status.`
+        });
+      }
+
+      // Refund escrow atomically (idempotent; no-op after settlement).
+      // The order is set CANCELLED only after the refund ledger entry succeeds.
+      await WalletService.releaseEscrow({
+        order,
+        reason: `Admin cancellation: ${reason}`,
+        requestId: req.id,
+        session
+      });
+
       order.status = OrderStatus.CANCELLED;
-      await order.save();
+      await order.save({ session });
 
       await AdminAuditLog.create({
         adminId,
@@ -98,14 +141,18 @@ export class AdminOpsController {
       });
 
       // Notify both parties
-      socketService.io.to(order.customerId.toString()).emit('order_cancelled', { orderId, reason });
+      getSocketService().io.to(order.customerId.toString()).emit('order_cancelled', { orderId, reason });
       if (order.driverId) {
-        socketService.io.to(order.driverId.toString()).emit('order_cancelled', { orderId, reason });
+        getSocketService().io.to(order.driverId.toString()).emit('order_cancelled', { orderId, reason });
       }
 
-      res.status(200).json({ success: true, message: 'ORDER_CANCELLED' });
+      const responsePayload = { success: true, message: 'ORDER_CANCELLED' };
+      await writeIdempotency(lookupKey, responsePayload, session);
+      res.status(200).json(responsePayload);
     } catch (error) {
       res.status(500).json({ error: 'CANCEL_FAILED' });
+    } finally {
+      session.endSession();
     }
   }
 
@@ -116,8 +163,14 @@ export class AdminOpsController {
     const { orderId } = req.params;
     const { isDisputed, note } = req.body;
     const adminId = req.user?.userId;
+    const idempotencyKey = req.idempotencyKey;
 
     try {
+      // M3: Idempotency lookup — replay returns the stored response.
+      const lookupKey = `admin:${adminId}:dispute:${orderId}:${idempotencyKey}`;
+      const existingReq = await readIdempotency(lookupKey);
+      if (existingReq) return res.status(200).json(existingReq.responseBody);
+
       // Note: We'd ideally add 'isDisputed' and 'disputeNote' fields to the Order Model
       const order = await Order.findByIdAndUpdate(orderId, {
         $set: { isDisputed, disputeNote: note }
@@ -131,7 +184,9 @@ export class AdminOpsController {
         details: note || 'Dispute status updated',
       });
 
-      res.status(200).json({ success: true, order });
+      const responsePayload = { success: true, order };
+      await writeIdempotency(lookupKey, responsePayload);
+      res.status(200).json(responsePayload);
     } catch (error) {
       res.status(500).json({ error: 'DISPUTE_UPDATE_FAILED' });
     }

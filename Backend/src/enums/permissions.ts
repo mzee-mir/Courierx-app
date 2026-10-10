@@ -1,5 +1,3 @@
-import { permission } from "process";
-
 export enum Permission {
   // Staff & Admin
   MANAGE_STAFF = 'MANAGE_STAFF',

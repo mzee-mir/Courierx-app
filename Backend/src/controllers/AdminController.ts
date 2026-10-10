@@ -12,6 +12,7 @@ import { PendingAction } from '../models/PendingAction';
 import { SystemSettings } from '../models/SystemSettings';
 import { SETTINGS_REGISTRY } from '../config/settingsRegistry';
 import { DriverLocation } from '../models/DriverLocation';
+import { readIdempotency, writeIdempotency } from '../utils/idempotency';
 
 export class AdminController {
   
@@ -36,6 +37,13 @@ export class AdminController {
   public static async verifyDriver(req: Request, res: Response) {
     const { id } = req.params;
     const { status, reason } = req.body;
+    const adminId = req.user?.userId;
+
+    // M3: Idempotency lookup — replay returns the stored response.
+    const lookupKey = `admin:${adminId}:verify_driver:${id}:${req.idempotencyKey}`;
+    const existingReq = await readIdempotency(lookupKey);
+    if (existingReq) return res.json(existingReq.responseBody);
+
     const session = await mongoose.startSession();
 
     try {
@@ -53,6 +61,9 @@ export class AdminController {
           adminId: req.user?.userId, action: 'VERIFY_DRIVER',
           targetId: id, targetModel: 'DriverProfile', details: reason, requestId: req.id
         }], { session });
+
+        const responsePayload = { success: true };
+        await writeIdempotency(lookupKey, responsePayload, session);
       });
       res.json({ success: true });
     } catch (e: any) {
@@ -479,6 +490,12 @@ public static async getDriverFullDetail(req: Request, res: Response) {
     try {
       const { id } = req.params;
       const { isSuspended, reason } = req.body; // Expecting { isSuspended: true, reason: "..." }
+      const adminId = req.user?.userId;
+
+      // M3: Idempotency lookup — replay returns the stored response.
+      const lookupKey = `admin:${adminId}:user_status:${id}:${isSuspended}:${req.idempotencyKey}`;
+      const existingReq = await readIdempotency(lookupKey);
+      if (existingReq) return res.status(200).json(existingReq.responseBody);
 
       // 1. Update the User record
       const user = await User.findByIdAndUpdate(
@@ -502,7 +519,9 @@ public static async getDriverFullDetail(req: Request, res: Response) {
 
       console.log(`SECURITY_LOG: User ${user.phoneNumber} is now ${isSuspended ? 'SUSPENDED' : 'ACTIVE'}`);
 
-      return res.status(200).json({ success: true, user });
+      const responsePayload = { success: true, user };
+      await writeIdempotency(lookupKey, responsePayload);
+      return res.status(200).json(responsePayload);
     } catch (error) {
       console.error('SUSPENSION_ERROR:', error);
       return res.status(500).json({ error: 'FAILED_TO_UPDATE_STATUS' });
@@ -692,6 +711,12 @@ public static async getDriverFullDetail(req: Request, res: Response) {
    */
   public static async createStaffAdmin(req: Request, res: Response) {
     const { email, password, displayName, role } = req.body;
+    const adminId = req.user?.userId;
+
+    // M3: Idempotency lookup — replay returns the stored response.
+    const lookupKey = `admin:${adminId}:create_staff:${req.idempotencyKey}`;
+    const existingReq = await readIdempotency(lookupKey);
+    if (existingReq) return res.status(201).json(existingReq.responseBody);
 
     try {
       // 1. Check if email exists
@@ -720,7 +745,9 @@ public static async getDriverFullDetail(req: Request, res: Response) {
         details: `Created new admin: ${email} with role ${role}`
       });
 
-      res.status(201).json({ success: true, admin: newAdmin });
+      const responsePayload = { success: true, admin: newAdmin };
+      await writeIdempotency(lookupKey, responsePayload);
+      res.status(201).json(responsePayload);
     } catch (error) {
       res.status(500).json({ error: 'CREATE_ADMIN_FAILED' });
     }
@@ -732,6 +759,12 @@ public static async getDriverFullDetail(req: Request, res: Response) {
   public static async updateStaffAdmin(req: Request, res: Response) {
     const { id } = req.params;
     const { displayName, email, role, password } = req.body;
+    const adminId = req.user?.userId;
+
+    // M3: Idempotency lookup — replay returns the stored response.
+    const lookupKey = `admin:${adminId}:update_staff:${id}:${req.idempotencyKey}`;
+    const existingReq = await readIdempotency(lookupKey);
+    if (existingReq) return res.status(200).json(existingReq.responseBody);
 
     try {
       const updateData: any = { displayName, email, roles: [role] };
@@ -754,7 +787,9 @@ public static async getDriverFullDetail(req: Request, res: Response) {
         details: `Updated staff member: ${email} to role ${role}`
       });
 
-      res.status(200).json({ success: true, admin: updatedMember });
+      const responsePayload = { success: true, admin: updatedMember };
+      await writeIdempotency(lookupKey, responsePayload);
+      res.status(200).json(responsePayload);
     } catch (error) {
       res.status(500).json({ error: 'UPDATE_FAILED' });
     }
@@ -821,6 +856,11 @@ public static async getDriverFullDetail(req: Request, res: Response) {
     const { id } = req.params;
     const adminId = req.user?.userId;
 
+    // M3: Idempotency lookup — replay returns the stored response.
+    const lookupKey = `admin:${adminId}:delete_staff:${id}:${req.idempotencyKey}`;
+    const existingReq = await readIdempotency(lookupKey);
+    if (existingReq) return res.json(existingReq.responseBody);
+
     const targetUser = await User.findById(id);
     if (!targetUser) return res.status(404).json({ error: 'NOT_FOUND' });
 
@@ -839,12 +879,21 @@ public static async getDriverFullDetail(req: Request, res: Response) {
       details: `Deleted admin account: ${targetUser.email}`, requestId: req.id
     });
 
-    res.json({ success: true });
+    const responsePayload = { success: true };
+    await writeIdempotency(lookupKey, responsePayload);
+    res.json(responsePayload);
   }
 
   public static async updateSystemSetting(req: Request, res: Response) {
     const { key, value, reason } = req.body;
     const config = SETTINGS_REGISTRY[key as keyof typeof SETTINGS_REGISTRY];
+    const adminId = req.user?.userId;
+
+    // M3: Idempotency lookup — replay returns the stored response so an admin
+    // retry cannot queue the SAME setting change twice (two PendingActions).
+    const lookupKey = `admin:${adminId}:update_setting:${key}:${req.idempotencyKey}`;
+    const existingReq = await readIdempotency(lookupKey);
+    if (existingReq) return res.status(202).json(existingReq.responseBody);
 
     // 1. Functional Observer Check
     if (!config) return res.status(404).json({ error: 'SETTING_NOT_FOUND' });
@@ -882,16 +931,24 @@ public static async getDriverFullDetail(req: Request, res: Response) {
       requestId: req.id
     });
 
-    res.status(202).json({ 
+    const responsePayload = { 
       success: true, 
       message: 'Action submitted for Dual-Authorization. Requires second Super Admin approval.',
       actionId: action._id 
-    });
+    };
+    await writeIdempotency(lookupKey, responsePayload);
+
+    res.status(202).json(responsePayload);
   }
 
   public static async approvePendingAction(req: Request, res: Response) {
     const { actionId } = req.params;
     const approverId = req.user?.userId;
+
+    // M3: Idempotency lookup — replay returns the stored response.
+    const lookupKey = `admin:${approverId}:approve_action:${actionId}:${req.idempotencyKey}`;
+    const existingReq = await readIdempotency(lookupKey);
+    if (existingReq) return res.json(existingReq.responseBody);
 
     const action = await PendingAction.findById(actionId);
     if (!action || action.status !== 'PENDING') throw new Error('ACTION_NOT_FOUND');
@@ -904,7 +961,9 @@ public static async getDriverFullDetail(req: Request, res: Response) {
     // Execute the actual setting change here...
     action.status = 'APPROVED';
     await action.save();
-    res.json({ success: true });
+    const responsePayload = { success: true };
+    await writeIdempotency(lookupKey, responsePayload);
+    res.json(responsePayload);
   }
 
   /**
@@ -1001,6 +1060,12 @@ public static async getDriverFullDetail(req: Request, res: Response) {
   public static async terminateUserSessions(req: Request, res: Response) {
     try {
       const { id } = req.params;
+      const adminId = req.user?.userId;
+
+      // M3: Idempotency lookup — replay returns the stored response.
+      const lookupKey = `admin:${adminId}:terminate_sessions:${id}:${req.idempotencyKey}`;
+      const existingReq = await readIdempotency(lookupKey);
+      if (existingReq) return res.json(existingReq.responseBody);
 
       // Increment version + Atomic update
       const user = await User.findByIdAndUpdate(
@@ -1021,7 +1086,9 @@ public static async getDriverFullDetail(req: Request, res: Response) {
         requestId: req.id
       });
 
-      res.json({ success: true, message: 'All active sessions have been invalidated.' });
+      const responsePayload = { success: true, message: 'All active sessions have been invalidated.' };
+      await writeIdempotency(lookupKey, responsePayload);
+      res.json(responsePayload);
     } catch (error) {
       res.status(500).json({ error: 'TERMINATION_FAILED' });
     }

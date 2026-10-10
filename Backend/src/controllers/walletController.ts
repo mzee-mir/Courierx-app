@@ -10,10 +10,10 @@ export const getBalance = async (req: Request, res: Response) => {
     let wallet = await Wallet.findOne({ userId });
     
     if (!wallet) {
-      wallet = await Wallet.create({ userId, balance: 0, tokenBalance: 0, currency: 'CXC' });
+      wallet = await Wallet.create({ userId, balance: 0, tokenBalance: 0, currency: 'USD' });
     }
 
-    res.status(200).json({ balance: wallet.tokenBalance, currency: wallet.currency });
+    res.status(200).json({ balance: wallet.balance, currency: wallet.currency });
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch wallet' });
   }
@@ -33,22 +33,22 @@ export const depositFunds = async (req: Request, res: Response) => {
   session.startTransaction();
 
   try {
-    const { Wallet } = require('../models/Wallet');
-    const { Transaction } = require('../models/Transaction');
-    const { simulateEvcPayment } = require('../services/evcService');
-
     let wallet = await Wallet.findOne({ userId }).session(session);
-    if (!wallet) wallet = await Wallet.create([{ userId, balance: 0 }], { session });
+    if (!wallet) {
+      const [created] = await Wallet.create([{ userId, balance: 0, currency: 'USD' }], { session });
+      wallet = created;
+    }
 
-    // 2. Initialize PENDING transaction
+    // 2. Initialize PENDING transaction with an external reference (provider tracking id)
     const externalRes = await simulateEvcPayment(phoneNumber, amount);
-    
+
     const transaction = await Transaction.create([{
-      walletId: wallet._id || wallet[0]._id,
+      walletId: wallet._id,
       userId,
       type: 'deposit',
       amount,
-      fee: carrierFee, // Ensure your Transaction model has this field
+      fee: carrierFee,
+      currency: 'USD',
       status: 'pending', // Always start as pending to handle lag
       provider: 'EVCPLUS',
       externalReference: externalRes.transactionId
@@ -62,9 +62,7 @@ export const depositFunds = async (req: Request, res: Response) => {
       transactionId: transaction[0]._id,
       status: 'pending',
       totalToPay: totalCharge
-    });
-
-  } catch (error) {
+    });  } catch (error) {
     await session.abortTransaction();
     res.status(500).json({ error: 'System busy, try later' });
   } finally {
@@ -75,7 +73,6 @@ export const depositFunds = async (req: Request, res: Response) => {
 export const getTransactions = async (req: Request, res: Response) => {
   try {
     const userId = req.user?.userId;
-    const { Transaction } = require('../models/Transaction');
 
     const transactions = await Transaction.find({ userId })
       .sort({ createdAt: -1 })
@@ -87,14 +84,25 @@ export const getTransactions = async (req: Request, res: Response) => {
   }
 };
 
+/**
+ * Pollable transaction status endpoint.
+ * The wallet screen polls this to reflect pending/complete/failed deposit states.
+ */
 export const checkTransactionStatus = async (req: Request, res: Response) => {
+  try {
     const { id } = req.params;
-    const { Transaction, Wallet } = require('../models/Transaction');
+    const userId = req.user?.userId;
 
     const tx = await Transaction.findById(id);
-    if (!tx) return res.status(404).json({ error: 'Not found' });
+    if (!tx) return res.status(404).json({ error: 'NOT_FOUND' });
 
-    // In a real system, you'd check the Telco Callback here.
-    // For MVP, we simulate a status change after 5 seconds.
-    res.status(200).json({ success: true, status: tx.status });
+    // Security: only the transaction owner may poll it.
+    if (tx.userId.toString() !== userId) {
+      return res.status(403).json({ error: 'FORBIDDEN' });
+    }
+
+    res.status(200).json({ success: true, status: tx.status, transactionId: tx._id });
+  } catch (error) {
+    res.status(500).json({ error: 'STATUS_FETCH_FAILED' });
+  }
 };
