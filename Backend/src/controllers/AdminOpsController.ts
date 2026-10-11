@@ -191,4 +191,83 @@ export class AdminOpsController {
       res.status(500).json({ error: 'DISPUTE_UPDATE_FAILED' });
     }
   }
+
+  /**
+   * Phase 5: Basic operational metrics endpoint for admin/ops visibility into daily order performance.
+   */
+  public static async getOperationsSummary(req: Request, res: Response) {
+    try {
+      const now = new Date();
+      const startOfDay = new Date(now);
+      startOfDay.setHours(0, 0, 0, 0);
+
+      // All orders created today
+      const [
+        totalOrders,
+        deliveredOrders,
+        cancelledOrders,
+        exhaustedOrders,
+        activeOrders,
+        dispatchRoundAgg,
+        topPickupsAgg,
+      ] = await Promise.all([
+        Order.countDocuments({ createdAt: { $gte: startOfDay } }),
+        Order.countDocuments({ createdAt: { $gte: startOfDay }, status: OrderStatus.DELIVERED }),
+        Order.countDocuments({ createdAt: { $gte: startOfDay }, status: OrderStatus.CANCELLED }),
+        Order.countDocuments({ createdAt: { $gte: startOfDay }, dispatchStatus: 'EXHAUSTED' }),
+        Order.countDocuments({
+          createdAt: { $gte: startOfDay },
+          status: {
+            $in: [
+              OrderStatus.PENDING,
+              OrderStatus.ACCEPTED,
+              OrderStatus.ARRIVED_AT_PICKUP,
+              OrderStatus.PICKED_UP,
+              OrderStatus.ARRIVED_AT_DROPOFF,
+              OrderStatus.CHAINED_RESERVED,
+            ],
+          },
+        }),
+        // Average dispatch round reached for today's orders
+        Order.aggregate([
+          { $match: { createdAt: { $gte: startOfDay }, dispatchRound: { $exists: true } } },
+          { $group: { _id: null, avg: { $avg: '$dispatchRound' } } },
+        ]),
+        // Top 5 pickup landmarks today
+        Order.aggregate([
+          { $match: { createdAt: { $gte: startOfDay }, pickupLandmark: { $exists: true, $ne: '' } } },
+          { $group: { _id: '$pickupLandmark', count: { $sum: 1 } } },
+          { $sort: { count: -1 } },
+          { $limit: 5 },
+          { $project: { _id: 0, name: '$_id', count: 1 } },
+        ]),
+      ]);
+
+      const completionRate =
+        totalOrders > 0
+          ? Math.round((deliveredOrders / totalOrders) * 1000) / 10
+          : 0;
+
+      return res.status(200).json({
+        success: true,
+        period: 'today',
+        generatedAt: now.toISOString(),
+        orders: {
+          total: totalOrders,
+          delivered: deliveredOrders,
+          cancelled: cancelledOrders,
+          active: activeOrders,
+          completionRate,
+        },
+        dispatch: {
+          exhaustedDispatches: exhaustedOrders,
+          averageDispatchRoundReached: Math.round((dispatchRoundAgg[0]?.avg || 1) * 10) / 10,
+        },
+        topPickupLandmarks: topPickupsAgg,
+      });
+    } catch (error: any) {
+      console.error('[AdminOpsController] getOperationsSummary error:', error.message);
+      return res.status(500).json({ error: 'OPS_SUMMARY_FAILED' });
+    }
+  }
 }

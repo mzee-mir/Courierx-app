@@ -490,8 +490,19 @@ export class OrderController {
 
       // Fetch Active Job, History, AND Current Online Status
       const [activeOrder, recentJobs, locationRecord] = await Promise.all([
-        Order.findOne({ driverId, status: { $in: ['ACCEPTED', 'PICKED_UP', 'ARRIVED'] } }),
-        Order.find({ driverId, status: 'DELIVERED' }).sort({ updatedAt: -1 }).limit(5),
+        Order.findOne({
+          driverId,
+          status: {
+            $in: [
+              OrderStatus.ACCEPTED,
+              OrderStatus.CHAINED_RESERVED,
+              OrderStatus.ARRIVED_AT_PICKUP,
+              OrderStatus.PICKED_UP,
+              OrderStatus.ARRIVED_AT_DROPOFF,
+            ]
+          }
+        }),
+        Order.find({ driverId, status: OrderStatus.DELIVERED }).sort({ updatedAt: -1 }).limit(5),
         DriverLocation.findOne({ userId: driverId })
       ]);
 
@@ -525,7 +536,9 @@ export class OrderController {
           { customerId: userId },
           { driverId: userId }
         ]
-      }).populate('driverId', 'displayName phoneNumber imageUrl');
+      })
+        .populate('driverId', 'displayName phoneNumber imageUrl')
+        .populate('customerId', 'displayName phoneNumber');
 
       /**
        * ✅ FIX: THE NULL GUARD

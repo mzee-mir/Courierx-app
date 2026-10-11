@@ -28,6 +28,7 @@ export enum Permission {
   BROADCAST_SENT = 'BROADCAST_SENT',
   SYSTEM_SETTINGS = 'SYSTEM_SETTINGS',
   KEY_SYSTEM_ADMIN = 'KEY_SYSTEM_ADMIN',
+  OPS_SUMMARY = 'OPS_SUMMARY',
   // Partner
   PARTNER_WRITE = "PARTNER_WRITE",
   INTERVENE_IMPORTS = "INTERVENE_IMPORTS",
@@ -57,6 +58,7 @@ export const ROLE_PERMISSIONS: Record<string, Permission[]> = {
     Permission.VIEW_DRIVER_LEADERBOARD,
     Permission.CUSTOMER_INSIGHTS,
     Permission.PENDING_DRIVERS,
+    Permission.OPS_SUMMARY,
   ],
   finance_admin: [
     Permission.CONFIRM_DEPOSITS,

@@ -104,6 +104,7 @@ describe('Phase 4 — Pre-Dispatching & Operational Intelligence', () => {
 
     const originalOrderFind = Order.find;
     const originalDriverProfileFind = DriverProfile.find;
+    const originalDriverLocationFind = DriverLocation.find;
 
     try {
       (Order.find as any) = (query: any) => {
@@ -119,6 +120,13 @@ describe('Phase 4 — Pre-Dispatching & Operational Intelligence', () => {
         select: () => [],
       });
 
+      // DriverLocation returns empty -> no idle candidates
+      (DriverLocation.find as any) = () => ({
+        select: () => ({
+          limit: () => [],
+        }),
+      });
+
       const candidates = await DispatchService.findCandidates({
         pickupCoordinates: pickupCoords,
         vehicleType: 'car',
@@ -132,6 +140,7 @@ describe('Phase 4 — Pre-Dispatching & Operational Intelligence', () => {
     } finally {
       Order.find = originalOrderFind;
       DriverProfile.find = originalDriverProfileFind;
+      DriverLocation.find = originalDriverLocationFind;
     }
   });
 
@@ -146,12 +155,19 @@ describe('Phase 4 — Pre-Dispatching & Operational Intelligence', () => {
     const originalFindOneAndUpdate = Order.findOneAndUpdate;
     const originalFindOneOffer = OrderOffer.findOne;
     const { Idempotency } = await import('../models/Idempotency');
+    const { AdminAuditLog } = await import('../models/AdminAuditLog');
     const originalIdempotencyFindOne = Idempotency.findOne;
     const originalIdempotencyCreate = Idempotency.create;
+    const originalAuditCreate = AdminAuditLog.create;
+    const originalDriverProfileUpdateOne = DriverProfile.updateOne;
+    const originalOfferUpdateMany = OrderOffer.updateMany;
 
     try {
       (Idempotency as any).findOne = async () => null;
       (Idempotency as any).create = async () => ({});
+      (AdminAuditLog as any).create = async () => [{}];
+      (DriverProfile as any).updateOne = async () => ({});
+      (OrderOffer as any).updateMany = async () => ({});
 
       (mongoose as any).startSession = async () => ({
         withTransaction: async (cb: any) => cb(),
@@ -220,6 +236,9 @@ describe('Phase 4 — Pre-Dispatching & Operational Intelligence', () => {
       OrderOffer.findOne = originalFindOneOffer;
       Idempotency.findOne = originalIdempotencyFindOne;
       Idempotency.create = originalIdempotencyCreate;
+      AdminAuditLog.create = originalAuditCreate;
+      DriverProfile.updateOne = originalDriverProfileUpdateOne;
+      OrderOffer.updateMany = originalOfferUpdateMany;
     }
   });
 

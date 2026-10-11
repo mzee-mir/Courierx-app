@@ -569,8 +569,13 @@ describe('6. Order Landmark Integration & Authoritative Coordinates', () => {
   it('candidate matching interface receives all coordinates and landmark IDs', async () => {
     let capturedCriteria: MatchingCriteria | null = null;
     const origFind = DriverLocation.find;
+    const origOrderFind = Order.find;
 
     (DriverLocation as any).find = () => ({
+      select: async () => [],
+    });
+
+    (Order as any).find = () => ({
       select: async () => [],
     });
 
@@ -588,6 +593,7 @@ describe('6. Order Landmark Integration & Authoritative Coordinates', () => {
       assert.deepStrictEqual(result, []);
     } finally {
       DriverLocation.find = origFind;
+      Order.find = origOrderFind;
     }
   });
 });

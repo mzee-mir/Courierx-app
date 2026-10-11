@@ -200,6 +200,11 @@ router.get('/customers/insights/risk',
     AdminController.getRiskMasterlist);
 
 // --- OPERATIONS & ORDERS (Super & Ops Only) ---
+router.get('/operations/summary',
+    authorizeAdmin([UserRole.SUPER_ADMIN, UserRole.OPS_ADMIN]),
+    enforceCapability(Permission.OPS_SUMMARY),
+    AdminOpsController.getOperationsSummary
+);
 router.get('/orders/active', 
     authorizeAdmin([UserRole.SUPER_ADMIN, 
         UserRole.OPS_ADMIN]), 
